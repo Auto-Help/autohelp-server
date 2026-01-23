@@ -32,7 +32,7 @@ const SMTP_PASS = process.env.SMTP_PASS;
 const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 
 // DB
-const DB_FILE = process.env.DB_FILE || "./autohelp.sqlite";
+const DB_FILE = process.env.DB_FILE || "/data/autohelp.sqlite";
 
 // ======================
 // CORS
