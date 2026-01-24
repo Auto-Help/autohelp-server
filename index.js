@@ -441,7 +441,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   const expiresAt = nowMs() + 30 * 60 * 1000;
   resetTokens.set(token, { email, expiresAt });
 
-  const resetLink = `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(token)}`;
+  const resetLink = `autohelp://reset-password?token=${encodeURIComponent(token)}`;
 
   try {
     const transporter = getTransporter();
