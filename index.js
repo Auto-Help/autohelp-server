@@ -17,7 +17,7 @@ app.use(express.json());
 // ======================
 const PORT = process.env.PORT || 4000;
 
-// Backwards compatible handling
+// Backwards compatible handling for older APP_BASE_URL usage
 const RAW_APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:5173";
 const looksLikeScheme =
   String(RAW_APP_BASE_URL).includes("://") && !String(RAW_APP_BASE_URL).startsWith("http");
@@ -28,7 +28,6 @@ const WEB_ORIGIN =
   (looksLikeScheme ? "http://localhost:5173" : RAW_APP_BASE_URL);
 
 // ✅ IMPORTANT: Your app.json scheme is "autohelp"
-// so deep link base must be "autohelp://"
 const APP_DEEP_LINK_BASE =
   process.env.APP_DEEP_LINK_BASE ||
   (looksLikeScheme ? RAW_APP_BASE_URL : "autohelp://");
@@ -49,6 +48,9 @@ const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 
 // DB
 const DB_FILE = process.env.DB_FILE || "/data/autohelp.sqlite";
+
+// Reset token config
+const RESET_TOKEN_TTL_MS = Number(process.env.RESET_TOKEN_TTL_MS || 30 * 60 * 1000); // 30 min
 
 // ======================
 // CORS
@@ -100,6 +102,7 @@ db.exec(`
     createdAt INTEGER NOT NULL
   );
 
+  -- Ratings: 1 vote per (userId, serviceId) forever
   CREATE TABLE IF NOT EXISTS ratings (
     id TEXT PRIMARY KEY,
     userId TEXT NOT NULL,
@@ -112,6 +115,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_ratings_serviceId ON ratings(serviceId);
   CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
   CREATE INDEX IF NOT EXISTS idx_companies_email ON companies(email);
+
+  -- ✅ PASSWORD RESET TOKENS (persistent, hashed, single-use)
+  CREATE TABLE IF NOT EXISTS password_resets (
+    tokenHash TEXT PRIMARY KEY,
+    accountType TEXT NOT NULL CHECK (accountType IN ('user','company')),
+    accountId TEXT NOT NULL,
+    expiresAt INTEGER NOT NULL,
+    createdAt INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_password_resets_expiresAt ON password_resets(expiresAt);
+  CREATE INDEX IF NOT EXISTS idx_password_resets_account ON password_resets(accountType, accountId);
 `);
 
 // ======================
@@ -146,6 +161,10 @@ function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
+function sha256Hex(input) {
+  return crypto.createHash("sha256").update(String(input)).digest("hex");
+}
+
 function requireUserAuth(req, res, next) {
   const auth = String(req.headers.authorization || "");
   const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -177,7 +196,7 @@ function getPublicBaseUrl(req) {
   return `${proto}://${host}`.replace(/\/+$/, "");
 }
 
-// ✅ Do not break scheme://
+// Do not break scheme://
 function normalizeDeepLinkBase(base) {
   let b = String(base || "").trim();
   if (!b) return "autohelp://";
@@ -191,6 +210,15 @@ function normalizeDeepLinkBase(base) {
 
   return b.replace(/\/+$/, "");
 }
+
+// Cleanup expired resets periodically (nice-to-have)
+setInterval(() => {
+  try {
+    db.prepare("DELETE FROM password_resets WHERE expiresAt <= ?").run(nowMs());
+  } catch {
+    // ignore
+  }
+}, 5 * 60 * 1000);
 
 // ======================
 // TEXTS for FORGOT/RESET
@@ -238,11 +266,10 @@ app.get("/reset-password", (req, res) => {
   const token = String(req.query.token || "");
   const deepBase = normalizeDeepLinkBase(APP_DEEP_LINK_BASE);
 
-  // ✅ Correct Expo Router deep link path format:
+  // Correct Expo Router deep link path format:
   // autohelp:///reset-password?token=...
   const appLink = `${deepBase}///reset-password?token=${encodeURIComponent(token)}`;
 
-  // Expo Go fallback (optional)
   const expoGoLink = EXP_DEEP_LINK_BASE
     ? `${EXP_DEEP_LINK_BASE}/--/reset-password?token=${encodeURIComponent(token)}`
     : "";
@@ -278,7 +305,6 @@ app.get("/reset-password", (req, res) => {
     </div>
 
     <script>
-      // Try open app
       setTimeout(() => { window.location.href = "${appLink}"; }, 200);
       ${expoGoLink ? `setTimeout(() => { window.location.href = "${expoGoLink}"; }, 900);` : ""}
     </script>
@@ -287,26 +313,7 @@ app.get("/reset-password", (req, res) => {
   `);
 });
 
-// ======================
-// DEMO GARAGES API
-// ======================
-const garages = [
-  {
-    id: 1,
-    name: "AGW / KFZ Technik",
-    address: "Liesinger-Flur Gasse 15, 1230 Wien",
-    phone: "+43 664 882 32500",
-    services: {
-      de: ["Öl- und Filterwechsel", "Spülungen", "Automatikgetriebe-Ölwechsel", "Diagnose"],
-      en: ["Oil and filter change", "Engine flush", "Automatic transmission oil change", "Diagnostics"],
-      bg: ["Смяна на масла и филтри", "Промивки", "Смяна на масла на автоматични кутии", "Диагностика"],
-    },
-  },
-];
 
-app.get("/garages", (req, res) => {
-  res.json(garages);
-});
 
 // ======================
 // AUTH: REGISTER USER
@@ -346,7 +353,7 @@ app.post("/api/auth/register-user", (req, res) => {
 });
 
 // ======================
-// AUTH: LOGIN USER
+// AUTH: LOGIN USER (email OR username)
 // ======================
 app.post("/api/auth/login-user", (req, res) => {
   const email = normalizeEmail(req.body?.email);
@@ -474,16 +481,8 @@ app.post("/api/auth/login-company", (req, res) => {
 });
 
 // ======================
-// FORGOT / RESET PASSWORD
+// FORGOT / RESET PASSWORD (PERSISTENT)
 // ======================
-const resetTokens = new Map();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, entry] of resetTokens.entries()) {
-    if (!entry || now > entry.expiresAt) resetTokens.delete(token);
-  }
-}, 60 * 1000);
 
 function findAccountByEmail(email) {
   const e = normalizeEmail(email);
@@ -494,25 +493,24 @@ function findAccountByEmail(email) {
   return null;
 }
 
-function updatePasswordByEmail(email, newPassword) {
-  const e = normalizeEmail(email);
+function updatePasswordByAccount(type, id, newPassword) {
   const passwordHash = bcrypt.hashSync(String(newPassword), 10);
-
-  const u = db.prepare("SELECT id FROM users WHERE email = ?").get(e);
-  if (u) {
-    db.prepare("UPDATE users SET passwordHash = ? WHERE id = ?").run(passwordHash, u.id);
+  if (type === "user") {
+    db.prepare("UPDATE users SET passwordHash = ? WHERE id = ?").run(passwordHash, id);
     return true;
   }
-
-  const c = db.prepare("SELECT id FROM companies WHERE email = ?").get(e);
-  if (c) {
-    db.prepare("UPDATE companies SET passwordHash = ? WHERE id = ?").run(passwordHash, c.id);
+  if (type === "company") {
+    db.prepare("UPDATE companies SET passwordHash = ? WHERE id = ?").run(passwordHash, id);
     return true;
   }
-
   return false;
 }
 
+/**
+ * POST /api/auth/forgot-password
+ * body: { email, lang }
+ * Always returns OK (does not reveal if account exists)
+ */
 app.post("/api/auth/forgot-password", async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const lang = String(req.body?.lang || "en");
@@ -525,12 +523,22 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
   if (!hasSmtp()) return res.json(genericOk);
 
-  const token = crypto.randomBytes(32).toString("hex");
-  const expiresAt = nowMs() + 30 * 60 * 1000;
-  resetTokens.set(token, { email, expiresAt });
+  // Create raw token, store only hash
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const tokenHash = sha256Hex(rawToken);
+  const createdAt = nowMs();
+  const expiresAt = createdAt + RESET_TOKEN_TTL_MS;
+
+  // Single active reset per account: delete old ones
+  db.prepare("DELETE FROM password_resets WHERE accountType = ? AND accountId = ?").run(acc.type, acc.id);
+
+  // Insert new reset
+  db.prepare(
+    "INSERT INTO password_resets (tokenHash, accountType, accountId, expiresAt, createdAt) VALUES (?, ?, ?, ?, ?)"
+  ).run(tokenHash, acc.type, acc.id, expiresAt, createdAt);
 
   const publicBase = getPublicBaseUrl(req);
-  const resetLink = `${publicBase}/reset-password?token=${encodeURIComponent(token)}`;
+  const resetLink = `${publicBase}/reset-password?token=${encodeURIComponent(rawToken)}`;
 
   try {
     const transporter = getTransporter();
@@ -549,6 +557,10 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   return res.json(genericOk);
 });
 
+/**
+ * POST /api/auth/reset-password
+ * body: { token, newPassword }
+ */
 app.post("/api/auth/reset-password", (req, res) => {
   const token = String(req.body?.token || "").trim();
   const newPassword = String(req.body?.newPassword || "");
@@ -557,16 +569,21 @@ app.post("/api/auth/reset-password", (req, res) => {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
 
-  const entry = resetTokens.get(token);
-  if (!entry) return res.status(400).json({ ok: false, error: "TOKEN_INVALID" });
+  const tokenHash = sha256Hex(token);
+  const row = db.prepare("SELECT * FROM password_resets WHERE tokenHash = ?").get(tokenHash);
 
-  if (nowMs() > entry.expiresAt) {
-    resetTokens.delete(token);
+  if (!row) return res.status(400).json({ ok: false, error: "TOKEN_INVALID" });
+
+  if (nowMs() > Number(row.expiresAt || 0)) {
+    db.prepare("DELETE FROM password_resets WHERE tokenHash = ?").run(tokenHash);
     return res.status(400).json({ ok: false, error: "TOKEN_EXPIRED" });
   }
 
-  const changed = updatePasswordByEmail(entry.email, newPassword);
-  resetTokens.delete(token);
+  // Update password (user or company)
+  const changed = updatePasswordByAccount(row.accountType, row.accountId, newPassword);
+
+  // Single-use: delete reset row
+  db.prepare("DELETE FROM password_resets WHERE tokenHash = ?").run(tokenHash);
 
   if (!changed) return res.status(400).json({ ok: false, error: "ACCOUNT_NOT_FOUND" });
 
