@@ -422,18 +422,34 @@ function updatePasswordByEmail(email, newPassword) {
  * body: { email, lang }
  * Връща винаги OK (за сигурност), дори да няма такъв email.
  */
-app.post("/api/auth/forgot-password", async (req, res) => {
+ app.post("/api/auth/forgot-password", async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const lang = String(req.body?.lang || "en");
   const genericOk = { ok: true, message: msg(lang, "genericSent") };
 
-  if (!email) return res.json(genericOk);
+  console.log("🔵 /forgot-password called with:", email);
+
+  if (!email) {
+    console.log("🟡 no email provided");
+    return res.json(genericOk);
+  }
 
   const acc = findAccountByEmail(email);
-  if (!acc) return res.json(genericOk);
+  if (!acc) {
+    console.log("🟡 account NOT found in DB for:", email);
+    return res.json(genericOk);
+  }
+
+  console.log("✅ account found:", acc);
 
   if (!hasSmtp()) {
-    console.warn("⚠️ SMTP not configured (.env). Cannot send emails yet.");
+    console.log("🔴 SMTP missing env vars:", {
+      SMTP_HOST: !!SMTP_HOST,
+      SMTP_PORT: !!SMTP_PORT,
+      SMTP_USER: !!SMTP_USER,
+      SMTP_PASS: !!SMTP_PASS,
+      SMTP_FROM: !!SMTP_FROM,
+    });
     return res.json(genericOk);
   }
 
@@ -441,25 +457,34 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   const expiresAt = nowMs() + 30 * 60 * 1000;
   resetTokens.set(token, { email, expiresAt });
 
-  const resetLink = `autohelp://reset-password?token=${encodeURIComponent(token)}`;
+  const resetLink = `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(token)}`;
+  console.log("🔗 resetLink:", resetLink);
 
   try {
     const transporter = getTransporter();
-    await transporter.sendMail({
+
+    // ✅ това ще каже дали SMTP изобщо е ОК
+    await transporter.verify();
+    console.log("✅ SMTP verify OK");
+
+    const info = await transporter.sendMail({
       from: SMTP_FROM,
       to: email,
       subject: msg(lang, "subject"),
       text: msg(lang, "emailText")(resetLink),
     });
+
+    console.log("✅ sendMail OK:", info?.messageId || info);
   } catch (e) {
-    console.error("sendMail error:", e);
+    console.log("❌ sendMail ERROR:", e?.message || e);
   }
 
   return res.json(genericOk);
 });
 
+
 /**
- * POST /api/auth/reset-password
+ * POST /api/auth/reset-passwordgit add index.js
  * body: { token, newPassword }
  */
 app.post("/api/auth/reset-password", (req, res) => {
