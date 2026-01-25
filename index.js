@@ -52,6 +52,50 @@ const DB_FILE = process.env.DB_FILE || "/data/autohelp.sqlite";
 // Reset token config
 const RESET_TOKEN_TTL_MS = Number(process.env.RESET_TOKEN_TTL_MS || 30 * 60 * 1000); // 30 min
 
+// Nearby defaults
+const DEFAULT_RADIUS_KM = Number(process.env.DEFAULT_RADIUS_KM || 50);
+
+// ======================
+// SIMPLE RATE LIMIT (in-memory)
+// production enough to stop obvious spam; for advanced you can move to redis later.
+// ======================
+function createRateLimiter({ windowMs, max, keyPrefix }) {
+  const hits = new Map(); // key => { count, resetAt }
+  const cleanupEveryMs = Math.max(30_000, Math.floor(windowMs / 2));
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits.entries()) {
+      if (!v || now >= v.resetAt) hits.delete(k);
+    }
+  }, cleanupEveryMs).unref?.();
+
+  return function rateLimit(req, res, next) {
+    const now = Date.now();
+    const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown")
+      .split(",")[0]
+      .trim();
+    const key = `${keyPrefix}:${ip}`;
+
+    const v = hits.get(key);
+    if (!v || now >= v.resetAt) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+
+    v.count += 1;
+    if (v.count > max) {
+      return res.status(429).json({ ok: false, error: "RATE_LIMIT" });
+    }
+    return next();
+  };
+}
+
+// Limits (tune as you like)
+const rlLogin = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "login" });
+const rlForgot = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5, keyPrefix: "forgot" });
+const rlReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "reset" });
+
 // ======================
 // CORS
 // ======================
@@ -64,6 +108,7 @@ app.use(
         if (origin === WEB_ORIGIN) return cb(null, true);
       }
 
+      // dev
       if (origin.startsWith("http://localhost:")) return cb(null, true);
       if (origin.startsWith("http://127.0.0.1:")) return cb(null, true);
 
@@ -129,6 +174,29 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_password_resets_account ON password_resets(accountType, accountId);
 `);
 
+// ---- Safe migrations for production (adds columns if missing)
+function hasColumn(table, col) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  return rows.some((r) => r.name === col);
+}
+
+function addColumnIfMissing(table, colDef) {
+  const colName = String(colDef).trim().split(/\s+/)[0];
+  if (!hasColumn(table, colName)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`);
+  }
+}
+
+// Companies location & working hours
+try {
+  addColumnIfMissing("companies", "lat REAL");
+  addColumnIfMissing("companies", "lng REAL");
+  // Optional: working hours as JSON (if you already have a different column, tell me and I'll map it)
+  addColumnIfMissing("companies", "workingHoursJson TEXT");
+} catch (e) {
+  console.log("⚠️ Migration warning:", e?.message || e);
+}
+
 // ======================
 // HELPERS
 // ======================
@@ -182,6 +250,23 @@ function requireUserAuth(req, res, next) {
   }
 }
 
+function requireCompanyAuth(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return res.status(401).json({ ok: false, error: "NO_TOKEN" });
+
+  try {
+    const decoded = jwt.verify(m[1], JWT_SECRET);
+    if (!decoded || decoded.type !== "company" || !decoded.companyId) {
+      return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
+    }
+    req.company = { companyId: decoded.companyId };
+    return next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
+  }
+}
+
 // Render / proxy safe base URL
 function getPublicBaseUrl(req) {
   const forced = String(process.env.PUBLIC_BASE_URL || "").trim();
@@ -211,7 +296,7 @@ function normalizeDeepLinkBase(base) {
   return b.replace(/\/+$/, "");
 }
 
-// Cleanup expired resets periodically (nice-to-have)
+// Cleanup expired resets periodically
 setInterval(() => {
   try {
     db.prepare("DELETE FROM password_resets WHERE expiresAt <= ?").run(nowMs());
@@ -219,6 +304,67 @@ setInterval(() => {
     // ignore
   }
 }, 5 * 60 * 1000);
+
+// Distance (Haversine)
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const toRad = (x) => (x * Math.PI) / 180;
+  const R = 6371; // km
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// Working hours helper (expects workingHoursJson like:
+// {"mon":[["08:00","17:00"]], "tue":[...], ...} OR [{"day":"mon","from":"08:00","to":"17:00"}] etc.
+// If unknown format -> returns null (won't break sorting hard)
+function isOpenNow(workingHoursJson) {
+  if (!workingHoursJson) return null;
+  let data = null;
+  try {
+    data = JSON.parse(workingHoursJson);
+  } catch {
+    return null;
+  }
+
+  const now = new Date();
+  const dayIdx = now.getDay(); // 0 Sun .. 6 Sat
+  const dayKey = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dayIdx];
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mm = String(now.getMinutes()).padStart(2, "0");
+  const cur = `${hh}:${mm}`;
+
+  // format A: object { mon: [["08:00","17:00"], ...], ... }
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const slots = data[dayKey];
+    if (!Array.isArray(slots)) return null;
+    for (const s of slots) {
+      if (Array.isArray(s) && s.length >= 2) {
+        const from = String(s[0]);
+        const to = String(s[1]);
+        if (from <= cur && cur <= to) return true;
+      }
+    }
+    return false;
+  }
+
+  // format B: array of { day:"mon", from:"08:00", to:"17:00" }
+  if (Array.isArray(data)) {
+    const slots = data.filter((x) => x && String(x.day).toLowerCase() === dayKey);
+    if (!slots.length) return null;
+    for (const s of slots) {
+      const from = String(s.from || "");
+      const to = String(s.to || "");
+      if (from && to && from <= cur && cur <= to) return true;
+    }
+    return false;
+  }
+
+  return null;
+}
 
 // ======================
 // TEXTS for FORGOT/RESET
@@ -266,8 +412,6 @@ app.get("/reset-password", (req, res) => {
   const token = String(req.query.token || "");
   const deepBase = normalizeDeepLinkBase(APP_DEEP_LINK_BASE);
 
-  // Correct Expo Router deep link path format:
-  // autohelp:///reset-password?token=...
   const appLink = `${deepBase}///reset-password?token=${encodeURIComponent(token)}`;
 
   const expoGoLink = EXP_DEEP_LINK_BASE
@@ -313,8 +457,6 @@ app.get("/reset-password", (req, res) => {
   `);
 });
 
-
-
 // ======================
 // AUTH: REGISTER USER
 // ======================
@@ -355,7 +497,7 @@ app.post("/api/auth/register-user", (req, res) => {
 // ======================
 // AUTH: LOGIN USER (email OR username)
 // ======================
-app.post("/api/auth/login-user", (req, res) => {
+app.post("/api/auth/login-user", rlLogin, (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const username = String(req.body?.username || "").trim();
   const password = String(req.body?.password || "");
@@ -391,9 +533,21 @@ app.post("/api/auth/login-user", (req, res) => {
 
 // ======================
 // AUTH: REGISTER COMPANY
+// Supports optional lat/lng + workingHoursJson if you send them.
 // ======================
 app.post("/api/auth/register-company", (req, res) => {
-  const { companyName = "", phone = "", address = "", email = "", password = "", categories = [] } = req.body || {};
+  const {
+    companyName = "",
+    phone = "",
+    address = "",
+    email = "",
+    password = "",
+    categories = [],
+    lat = null,
+    lng = null,
+    workingHoursJson = null,
+  } = req.body || {};
+
   const e = normalizeEmail(email);
 
   if (
@@ -418,18 +572,24 @@ app.post("/api/auth/register-company", (req, res) => {
   const passwordHash = bcrypt.hashSync(String(password), 10);
   const createdAt = nowMs();
 
-  db.prepare(
-    "INSERT INTO companies (id, email, companyName, phone, address, passwordHash, categoriesJson, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(
-    id,
-    e,
-    String(companyName).trim(),
-    String(phone).trim(),
-    String(address).trim(),
-    passwordHash,
-    JSON.stringify(categories),
-    createdAt
-  );
+  const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
+  const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
+
+  // Insert with optional columns (if they exist)
+  const hasLat = hasColumn("companies", "lat");
+  const hasLng = hasColumn("companies", "lng");
+  const hasWH = hasColumn("companies", "workingHoursJson");
+
+  const cols = ["id", "email", "companyName", "phone", "address", "passwordHash", "categoriesJson", "createdAt"];
+  const vals = [id, e, String(companyName).trim(), String(phone).trim(), String(address).trim(), passwordHash, JSON.stringify(categories), createdAt];
+
+  if (hasLat) { cols.push("lat"); vals.push(Number.isFinite(latNum) ? latNum : null); }
+  if (hasLng) { cols.push("lng"); vals.push(Number.isFinite(lngNum) ? lngNum : null); }
+  if (hasWH) { cols.push("workingHoursJson"); vals.push(workingHoursJson ? String(workingHoursJson) : null); }
+
+  const placeholders = cols.map(() => "?").join(", ");
+  const sql = `INSERT INTO companies (${cols.join(", ")}) VALUES (${placeholders})`;
+  db.prepare(sql).run(...vals);
 
   const token = signToken({ type: "company", companyId: id });
 
@@ -443,6 +603,8 @@ app.post("/api/auth/register-company", (req, res) => {
       phone: String(phone).trim(),
       address: String(address).trim(),
       categories,
+      lat: Number.isFinite(latNum) ? latNum : null,
+      lng: Number.isFinite(lngNum) ? lngNum : null,
       createdAt,
     },
   });
@@ -451,7 +613,7 @@ app.post("/api/auth/register-company", (req, res) => {
 // ======================
 // AUTH: LOGIN COMPANY
 // ======================
-app.post("/api/auth/login-company", (req, res) => {
+app.post("/api/auth/login-company", rlLogin, (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const password = String(req.body?.password || "");
 
@@ -475,15 +637,48 @@ app.post("/api/auth/login-company", (req, res) => {
       phone: row.phone,
       address: row.address,
       categories: JSON.parse(row.categoriesJson || "[]"),
+      lat: row.lat ?? null,
+      lng: row.lng ?? null,
+      workingHoursJson: row.workingHoursJson ?? null,
       createdAt: row.createdAt,
     },
   });
 });
 
 // ======================
+// COMPANY: UPDATE LOCATION / HOURS (optional but useful)
+// ======================
+app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
+  const companyId = req.company.companyId;
+
+  const lat = req.body?.lat;
+  const lng = req.body?.lng;
+  const workingHoursJson = req.body?.workingHoursJson;
+
+  const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
+  const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
+
+  const sets = [];
+  const vals = [];
+
+  if (hasColumn("companies", "lat")) { sets.push("lat = ?"); vals.push(Number.isFinite(latNum) ? latNum : null); }
+  if (hasColumn("companies", "lng")) { sets.push("lng = ?"); vals.push(Number.isFinite(lngNum) ? lngNum : null); }
+  if (hasColumn("companies", "workingHoursJson") && workingHoursJson !== undefined) {
+    sets.push("workingHoursJson = ?");
+    vals.push(workingHoursJson ? String(workingHoursJson) : null);
+  }
+
+  if (!sets.length) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+
+  vals.push(companyId);
+  db.prepare(`UPDATE companies SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+
+  return res.json({ ok: true });
+});
+
+// ======================
 // FORGOT / RESET PASSWORD (PERSISTENT)
 // ======================
-
 function findAccountByEmail(email) {
   const e = normalizeEmail(email);
   const u = db.prepare("SELECT id, email FROM users WHERE email = ?").get(e);
@@ -506,12 +701,7 @@ function updatePasswordByAccount(type, id, newPassword) {
   return false;
 }
 
-/**
- * POST /api/auth/forgot-password
- * body: { email, lang }
- * Always returns OK (does not reveal if account exists)
- */
-app.post("/api/auth/forgot-password", async (req, res) => {
+app.post("/api/auth/forgot-password", rlForgot, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const lang = String(req.body?.lang || "en");
   const genericOk = { ok: true, message: msg(lang, "genericSent") };
@@ -523,16 +713,13 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
   if (!hasSmtp()) return res.json(genericOk);
 
-  // Create raw token, store only hash
   const rawToken = crypto.randomBytes(32).toString("hex");
   const tokenHash = sha256Hex(rawToken);
   const createdAt = nowMs();
   const expiresAt = createdAt + RESET_TOKEN_TTL_MS;
 
-  // Single active reset per account: delete old ones
   db.prepare("DELETE FROM password_resets WHERE accountType = ? AND accountId = ?").run(acc.type, acc.id);
 
-  // Insert new reset
   db.prepare(
     "INSERT INTO password_resets (tokenHash, accountType, accountId, expiresAt, createdAt) VALUES (?, ?, ?, ?, ?)"
   ).run(tokenHash, acc.type, acc.id, expiresAt, createdAt);
@@ -557,11 +744,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   return res.json(genericOk);
 });
 
-/**
- * POST /api/auth/reset-password
- * body: { token, newPassword }
- */
-app.post("/api/auth/reset-password", (req, res) => {
+app.post("/api/auth/reset-password", rlReset, (req, res) => {
   const token = String(req.body?.token || "").trim();
   const newPassword = String(req.body?.newPassword || "");
 
@@ -579,15 +762,161 @@ app.post("/api/auth/reset-password", (req, res) => {
     return res.status(400).json({ ok: false, error: "TOKEN_EXPIRED" });
   }
 
-  // Update password (user or company)
   const changed = updatePasswordByAccount(row.accountType, row.accountId, newPassword);
 
-  // Single-use: delete reset row
   db.prepare("DELETE FROM password_resets WHERE tokenHash = ?").run(tokenHash);
 
   if (!changed) return res.status(400).json({ ok: false, error: "ACCOUNT_NOT_FOUND" });
 
   return res.json({ ok: true });
+});
+
+// ======================
+// NEARBY COMPANIES (distance + openNow + ratings)
+// ======================
+function parseCategories(categoriesJson) {
+  try {
+    const arr = JSON.parse(categoriesJson || "[]");
+    return Array.isArray(arr) ? arr.map((x) => String(x)) : [];
+  } catch {
+    return [];
+  }
+}
+
+app.get("/api/companies/nearby", (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  const radiusKm = req.query.radiusKm ? Number(req.query.radiusKm) : DEFAULT_RADIUS_KM;
+  const category = req.query.category ? String(req.query.category) : "";
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  }
+
+  // Fetch companies with location
+  const rows = db.prepare(`
+    SELECT
+      c.*,
+      COALESCE(r.avgRating, 0) as avgRating,
+      COALESCE(r.votes, 0) as votes
+    FROM companies c
+    LEFT JOIN (
+      SELECT serviceId, AVG(value) as avgRating, COUNT(*) as votes
+      FROM ratings
+      GROUP BY serviceId
+    ) r ON r.serviceId = c.id
+    WHERE c.lat IS NOT NULL AND c.lng IS NOT NULL
+  `).all();
+
+  const out = [];
+  for (const c of rows) {
+    const d = haversineKm(lat, lng, Number(c.lat), Number(c.lng));
+    if (Number.isFinite(radiusKm) && d > radiusKm) continue;
+
+    const cats = parseCategories(c.categoriesJson);
+    if (category && !cats.includes(category)) continue;
+
+    const openNow = isOpenNow(c.workingHoursJson);
+
+    out.push({
+      id: c.id,
+      email: c.email,
+      companyName: c.companyName,
+      phone: c.phone,
+      address: c.address,
+      categories: cats,
+      lat: Number(c.lat),
+      lng: Number(c.lng),
+      distanceKm: Number(d.toFixed(2)),
+      openNow, // true/false/null
+      rating: {
+        average: Number(Number(c.avgRating || 0).toFixed(2)),
+        votes: Number(c.votes || 0),
+      },
+    });
+  }
+
+  // Sort: openNow true first, then distance asc, then rating desc, then votes desc
+  out.sort((a, b) => {
+    const aOpen = a.openNow === true ? 1 : 0;
+    const bOpen = b.openNow === true ? 1 : 0;
+    if (aOpen !== bOpen) return bOpen - aOpen;
+
+    if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
+
+    if (a.rating.average !== b.rating.average) return b.rating.average - a.rating.average;
+
+    return b.rating.votes - a.rating.votes;
+  });
+
+  return res.json({ ok: true, items: out });
+});
+
+// Convenience endpoint: nearest single
+app.get("/api/companies/nearest", (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  const radiusKm = req.query.radiusKm ? Number(req.query.radiusKm) : DEFAULT_RADIUS_KM;
+  const category = req.query.category ? String(req.query.category) : "";
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  }
+
+  const r = app._router; // noop to avoid lint warnings
+
+  // reuse logic by calling nearby internally (simple)
+  const rows = db.prepare(`
+    SELECT
+      c.*,
+      COALESCE(r.avgRating, 0) as avgRating,
+      COALESCE(r.votes, 0) as votes
+    FROM companies c
+    LEFT JOIN (
+      SELECT serviceId, AVG(value) as avgRating, COUNT(*) as votes
+      FROM ratings
+      GROUP BY serviceId
+    ) r ON r.serviceId = c.id
+    WHERE c.lat IS NOT NULL AND c.lng IS NOT NULL
+  `).all();
+
+  const out = [];
+  for (const c of rows) {
+    const d = haversineKm(lat, lng, Number(c.lat), Number(c.lng));
+    if (Number.isFinite(radiusKm) && d > radiusKm) continue;
+
+    const cats = parseCategories(c.categoriesJson);
+    if (category && !cats.includes(category)) continue;
+
+    const openNow = isOpenNow(c.workingHoursJson);
+
+    out.push({
+      id: c.id,
+      companyName: c.companyName,
+      phone: c.phone,
+      address: c.address,
+      categories: cats,
+      lat: Number(c.lat),
+      lng: Number(c.lng),
+      distanceKm: Number(d.toFixed(2)),
+      openNow,
+      rating: {
+        average: Number(Number(c.avgRating || 0).toFixed(2)),
+        votes: Number(c.votes || 0),
+      },
+    });
+  }
+
+  out.sort((a, b) => {
+    const aOpen = a.openNow === true ? 1 : 0;
+    const bOpen = b.openNow === true ? 1 : 0;
+    if (aOpen !== bOpen) return bOpen - aOpen;
+    if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
+    if (a.rating.average !== b.rating.average) return b.rating.average - a.rating.average;
+    return b.rating.votes - a.rating.votes;
+  });
+
+  return res.json({ ok: true, item: out[0] || null });
 });
 
 // ======================
