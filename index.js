@@ -17,24 +17,24 @@ app.use(express.json());
 // ======================
 const PORT = process.env.PORT || 4000;
 
-// ✅ IMPORTANT: Split "web origin" (CORS) vs "mobile deep link base"
-// - WEB_ORIGIN: your website origin (e.g. https://autohelp-web.onrender.com)
-// - APP_BASE_URL: mobile deep link base (e.g. autohelpmobile:// or autohelp://)
-//
-// Backwards compatible:
-// If APP_BASE_URL looks like a URL scheme (contains "://"), we treat it as deep link base.
-// Otherwise we treat it as WEB_ORIGIN (old behavior).
+// Backwards compatible handling
 const RAW_APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:5173";
-const looksLikeScheme = String(RAW_APP_BASE_URL).includes("://") && !String(RAW_APP_BASE_URL).startsWith("http");
+const looksLikeScheme =
+  String(RAW_APP_BASE_URL).includes("://") && !String(RAW_APP_BASE_URL).startsWith("http");
 
 const WEB_ORIGIN =
   process.env.WEB_ORIGIN ||
   process.env.CORS_ORIGIN ||
   (looksLikeScheme ? "http://localhost:5173" : RAW_APP_BASE_URL);
 
+// ✅ IMPORTANT: Your app.json scheme is "autohelp"
+// so deep link base must be "autohelp://"
 const APP_DEEP_LINK_BASE =
   process.env.APP_DEEP_LINK_BASE ||
-  (looksLikeScheme ? RAW_APP_BASE_URL : "autohelpmobile://");
+  (looksLikeScheme ? RAW_APP_BASE_URL : "autohelp://");
+
+// Expo Go fallback base (optional)
+const EXP_DEEP_LINK_BASE = String(process.env.EXP_DEEP_LINK_BASE || "").trim().replace(/\/+$/, "");
 
 // JWT
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_ME_DEV_SECRET";
@@ -56,15 +56,12 @@ const DB_FILE = process.env.DB_FILE || "/data/autohelp.sqlite";
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow mobile apps / server-to-server / dev tools (no origin)
       if (!origin) return cb(null, true);
 
-      // Allow configured web origin (if it is http/https)
       if (WEB_ORIGIN && (WEB_ORIGIN.startsWith("http://") || WEB_ORIGIN.startsWith("https://"))) {
         if (origin === WEB_ORIGIN) return cb(null, true);
       }
 
-      // allow localhost variants in dev
       if (origin.startsWith("http://localhost:")) return cb(null, true);
       if (origin.startsWith("http://127.0.0.1:")) return cb(null, true);
 
@@ -103,7 +100,6 @@ db.exec(`
     createdAt INTEGER NOT NULL
   );
 
-  -- Ratings: 1 vote per (userId, serviceId) forever
   CREATE TABLE IF NOT EXISTS ratings (
     id TEXT PRIMARY KEY,
     userId TEXT NOT NULL,
@@ -167,25 +163,33 @@ function requireUserAuth(req, res, next) {
   }
 }
 
-// ✅ Determine public base URL for links (Render / proxy safe)
+// Render / proxy safe base URL
 function getPublicBaseUrl(req) {
-  // If you want, you can set PUBLIC_BASE_URL=https://autohelp-server.onrender.com
   const forced = String(process.env.PUBLIC_BASE_URL || "").trim();
   if (forced) return forced.replace(/\/+$/, "");
 
   const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
     .split(",")[0]
     .trim();
-  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "").split(",")[0].trim();
+  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "")
+    .split(",")[0]
+    .trim();
   return `${proto}://${host}`.replace(/\/+$/, "");
 }
 
+// ✅ Do not break scheme://
 function normalizeDeepLinkBase(base) {
   let b = String(base || "").trim();
-  if (!b) b = "autohelpmobile://";
-  // Ensure no trailing slash at end like autohelpmobile:/// or autohelpmobile:///
-  b = b.replace(/\/+$/, "");
-  return b;
+  if (!b) return "autohelp://";
+
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(b)) {
+    const idx = b.indexOf("://");
+    const scheme = b.slice(0, idx);
+    const rest = b.slice(idx + 3).replace(/\/+$/, "");
+    return rest ? `${scheme}://${rest}` : `${scheme}://`;
+  }
+
+  return b.replace(/\/+$/, "");
 }
 
 // ======================
@@ -228,13 +232,20 @@ app.get("/", (req, res) => {
 });
 
 // ======================
-// ✅ RESET PASSWORD LANDING PAGE (fixes: Cannot GET /reset-password)
-// This page opens the mobile app via deep link
+// RESET PASSWORD LANDING PAGE
 // ======================
 app.get("/reset-password", (req, res) => {
   const token = String(req.query.token || "");
   const deepBase = normalizeDeepLinkBase(APP_DEEP_LINK_BASE);
-  const deepLink = `${deepBase}/reset-password?token=${encodeURIComponent(token)}`;
+
+  // ✅ Correct Expo Router deep link path format:
+  // autohelp:///reset-password?token=...
+  const appLink = `${deepBase}///reset-password?token=${encodeURIComponent(token)}`;
+
+  // Expo Go fallback (optional)
+  const expoGoLink = EXP_DEEP_LINK_BASE
+    ? `${EXP_DEEP_LINK_BASE}/--/reset-password?token=${encodeURIComponent(token)}`
+    : "";
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`
@@ -246,28 +257,38 @@ app.get("/reset-password", (req, res) => {
     <title>AutoHelp – Reset password</title>
     <style>
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0b0f14;color:#fff}
-      .card{max-width:560px;padding:24px;border:1px solid #2a2f3a;border-radius:16px;background:#111827}
+      .card{max-width:680px;padding:24px;border:1px solid #2a2f3a;border-radius:16px;background:#111827}
       a.btn{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:12px;background:#f59e0b;color:#000;text-decoration:none;font-weight:800}
       .muted{opacity:.75;margin-top:10px;line-height:1.35}
       code{background:#0b1220;padding:2px 6px;border-radius:8px}
-      .row{margin-top:10px}
+      .row{margin-top:10px; word-break:break-all;}
     </style>
   </head>
   <body>
     <div class="card">
       <h2 style="margin:0 0 8px 0;">Смяна на парола</h2>
       <div class="muted">Натисни бутона, за да отвориш AutoHelp и да смениш паролата.</div>
-      <a class="btn" href="${deepLink}">Open AutoHelp</a>
+
+      <a class="btn" href="${appLink}">Open AutoHelp</a>
+      ${expoGoLink ? `<a class="btn" style="margin-left:10px" href="${expoGoLink}">Open in Expo Go</a>` : ""}
+
       <div class="row muted">Ако си на компютър — отвори имейла на телефона.</div>
-      <div class="row muted">Deep link: <code>${deepLink}</code></div>
+      <div class="row muted">App deep link: <code>${appLink}</code></div>
+      ${expoGoLink ? `<div class="row muted">Expo Go link: <code>${expoGoLink}</code></div>` : ""}
     </div>
+
+    <script>
+      // Try open app
+      setTimeout(() => { window.location.href = "${appLink}"; }, 200);
+      ${expoGoLink ? `setTimeout(() => { window.location.href = "${expoGoLink}"; }, 900);` : ""}
+    </script>
   </body>
 </html>
   `);
 });
 
 // ======================
-// DEMO GARAGES API (kept)
+// DEMO GARAGES API
 // ======================
 const garages = [
   {
@@ -325,7 +346,7 @@ app.post("/api/auth/register-user", (req, res) => {
 });
 
 // ======================
-// AUTH: LOGIN USER (email OR username)
+// AUTH: LOGIN USER
 // ======================
 app.post("/api/auth/login-user", (req, res) => {
   const email = normalizeEmail(req.body?.email);
@@ -455,8 +476,6 @@ app.post("/api/auth/login-company", (req, res) => {
 // ======================
 // FORGOT / RESET PASSWORD
 // ======================
-
-// reset token store: token => { email, expiresAt }
 const resetTokens = new Map();
 
 setInterval(() => {
@@ -494,67 +513,35 @@ function updatePasswordByEmail(email, newPassword) {
   return false;
 }
 
-/**
- * POST /api/auth/forgot-password
- * body: { email, lang }
- * Връща винаги OK (за сигурност), дори да няма такъв email.
- */
 app.post("/api/auth/forgot-password", async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const lang = String(req.body?.lang || "en");
   const genericOk = { ok: true, message: msg(lang, "genericSent") };
 
-  console.log("🔵 /forgot-password called with:", email);
-
-  if (!email) {
-    console.log("🟡 no email provided");
-    return res.json(genericOk);
-  }
+  if (!email) return res.json(genericOk);
 
   const acc = findAccountByEmail(email);
-  if (!acc) {
-    console.log("🟡 account NOT found in DB for:", email);
-    return res.json(genericOk);
-  }
+  if (!acc) return res.json(genericOk);
 
-  console.log("✅ account found:", acc);
-
-  if (!hasSmtp()) {
-    console.log("🔴 SMTP missing env vars:", {
-      SMTP_HOST: !!SMTP_HOST,
-      SMTP_PORT: !!SMTP_PORT,
-      SMTP_USER: !!SMTP_USER,
-      SMTP_PASS: !!SMTP_PASS,
-      SMTP_FROM: !!SMTP_FROM,
-    });
-    return res.json(genericOk);
-  }
+  if (!hasSmtp()) return res.json(genericOk);
 
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = nowMs() + 30 * 60 * 1000;
   resetTokens.set(token, { email, expiresAt });
 
-  // ✅ Email should link to backend landing page (GET /reset-password),
-  // which then opens the mobile app via deep link.
   const publicBase = getPublicBaseUrl(req);
   const resetLink = `${publicBase}/reset-password?token=${encodeURIComponent(token)}`;
-  console.log("🔗 resetLink:", resetLink);
 
   try {
     const transporter = getTransporter();
-
-    // ✅ проверка дали SMTP е ОК
     await transporter.verify();
-    console.log("✅ SMTP verify OK");
 
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: SMTP_FROM,
       to: email,
       subject: msg(lang, "subject"),
       text: msg(lang, "emailText")(resetLink),
     });
-
-    console.log("✅ sendMail OK:", info?.messageId || info);
   } catch (e) {
     console.log("❌ sendMail ERROR:", e?.message || e);
   }
@@ -562,10 +549,6 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   return res.json(genericOk);
 });
 
-/**
- * POST /api/auth/reset-password
- * body: { token, newPassword }
- */
 app.post("/api/auth/reset-password", (req, res) => {
   const token = String(req.body?.token || "").trim();
   const newPassword = String(req.body?.newPassword || "");
@@ -591,17 +574,8 @@ app.post("/api/auth/reset-password", (req, res) => {
 });
 
 // ======================
-// RATINGS (1 vote per user per service)
+// RATINGS
 // ======================
-
-/**
- * POST /api/ratings
- * headers: Authorization: Bearer <token>  (USER token)
- * body: { serviceId, value } value: 1..5
- *
- * Rule: user can vote only once per service.
- * If already voted -> 409 ALREADY_VOTED
- */
 app.post("/api/ratings", requireUserAuth, (req, res) => {
   const userId = req.user.userId;
   const serviceId = String(req.body?.serviceId || "").trim();
@@ -650,9 +624,6 @@ app.post("/api/ratings", requireUserAuth, (req, res) => {
   });
 });
 
-/**
- * GET /api/ratings/stats/:serviceId
- */
 app.get("/api/ratings/stats/:serviceId", (req, res) => {
   const serviceId = String(req.params.serviceId || "").trim();
   if (!serviceId) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
