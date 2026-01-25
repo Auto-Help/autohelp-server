@@ -17,8 +17,24 @@ app.use(express.json());
 // ======================
 const PORT = process.env.PORT || 4000;
 
-// Frontend origin (CORS)
-const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:5173";
+// ✅ IMPORTANT: Split "web origin" (CORS) vs "mobile deep link base"
+// - WEB_ORIGIN: your website origin (e.g. https://autohelp-web.onrender.com)
+// - APP_BASE_URL: mobile deep link base (e.g. autohelpmobile:// or autohelp://)
+//
+// Backwards compatible:
+// If APP_BASE_URL looks like a URL scheme (contains "://"), we treat it as deep link base.
+// Otherwise we treat it as WEB_ORIGIN (old behavior).
+const RAW_APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:5173";
+const looksLikeScheme = String(RAW_APP_BASE_URL).includes("://") && !String(RAW_APP_BASE_URL).startsWith("http");
+
+const WEB_ORIGIN =
+  process.env.WEB_ORIGIN ||
+  process.env.CORS_ORIGIN ||
+  (looksLikeScheme ? "http://localhost:5173" : RAW_APP_BASE_URL);
+
+const APP_DEEP_LINK_BASE =
+  process.env.APP_DEEP_LINK_BASE ||
+  (looksLikeScheme ? RAW_APP_BASE_URL : "autohelpmobile://");
 
 // JWT
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_ME_DEV_SECRET";
@@ -43,8 +59,10 @@ app.use(
       // allow mobile apps / server-to-server / dev tools (no origin)
       if (!origin) return cb(null, true);
 
-      // allow your frontend origin
-      if (origin === APP_BASE_URL) return cb(null, true);
+      // Allow configured web origin (if it is http/https)
+      if (WEB_ORIGIN && (WEB_ORIGIN.startsWith("http://") || WEB_ORIGIN.startsWith("https://"))) {
+        if (origin === WEB_ORIGIN) return cb(null, true);
+      }
 
       // allow localhost variants in dev
       if (origin.startsWith("http://localhost:")) return cb(null, true);
@@ -149,6 +167,27 @@ function requireUserAuth(req, res, next) {
   }
 }
 
+// ✅ Determine public base URL for links (Render / proxy safe)
+function getPublicBaseUrl(req) {
+  // If you want, you can set PUBLIC_BASE_URL=https://autohelp-server.onrender.com
+  const forced = String(process.env.PUBLIC_BASE_URL || "").trim();
+  if (forced) return forced.replace(/\/+$/, "");
+
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "").split(",")[0].trim();
+  return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
+function normalizeDeepLinkBase(base) {
+  let b = String(base || "").trim();
+  if (!b) b = "autohelpmobile://";
+  // Ensure no trailing slash at end like autohelpmobile:/// or autohelpmobile:///
+  b = b.replace(/\/+$/, "");
+  return b;
+}
+
 // ======================
 // TEXTS for FORGOT/RESET
 // ======================
@@ -186,6 +225,45 @@ function msg(lang, key) {
 // ======================
 app.get("/", (req, res) => {
   res.send("AutoHelp server is running ✅");
+});
+
+// ======================
+// ✅ RESET PASSWORD LANDING PAGE (fixes: Cannot GET /reset-password)
+// This page opens the mobile app via deep link
+// ======================
+app.get("/reset-password", (req, res) => {
+  const token = String(req.query.token || "");
+  const deepBase = normalizeDeepLinkBase(APP_DEEP_LINK_BASE);
+  const deepLink = `${deepBase}/reset-password?token=${encodeURIComponent(token)}`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoHelp – Reset password</title>
+    <style>
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0b0f14;color:#fff}
+      .card{max-width:560px;padding:24px;border:1px solid #2a2f3a;border-radius:16px;background:#111827}
+      a.btn{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:12px;background:#f59e0b;color:#000;text-decoration:none;font-weight:800}
+      .muted{opacity:.75;margin-top:10px;line-height:1.35}
+      code{background:#0b1220;padding:2px 6px;border-radius:8px}
+      .row{margin-top:10px}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2 style="margin:0 0 8px 0;">Смяна на парола</h2>
+      <div class="muted">Натисни бутона, за да отвориш AutoHelp и да смениш паролата.</div>
+      <a class="btn" href="${deepLink}">Open AutoHelp</a>
+      <div class="row muted">Ако си на компютър — отвори имейла на телефона.</div>
+      <div class="row muted">Deep link: <code>${deepLink}</code></div>
+    </div>
+  </body>
+</html>
+  `);
 });
 
 // ======================
@@ -325,7 +403,6 @@ app.post("/api/auth/register-company", (req, res) => {
     createdAt
   );
 
-  // company token (ако ти трябва по-късно)
   const token = signToken({ type: "company", companyId: id });
 
   return res.json({
@@ -422,7 +499,7 @@ function updatePasswordByEmail(email, newPassword) {
  * body: { email, lang }
  * Връща винаги OK (за сигурност), дори да няма такъв email.
  */
- app.post("/api/auth/forgot-password", async (req, res) => {
+app.post("/api/auth/forgot-password", async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const lang = String(req.body?.lang || "en");
   const genericOk = { ok: true, message: msg(lang, "genericSent") };
@@ -457,13 +534,16 @@ function updatePasswordByEmail(email, newPassword) {
   const expiresAt = nowMs() + 30 * 60 * 1000;
   resetTokens.set(token, { email, expiresAt });
 
-  const resetLink = `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(token)}`;
+  // ✅ Email should link to backend landing page (GET /reset-password),
+  // which then opens the mobile app via deep link.
+  const publicBase = getPublicBaseUrl(req);
+  const resetLink = `${publicBase}/reset-password?token=${encodeURIComponent(token)}`;
   console.log("🔗 resetLink:", resetLink);
 
   try {
     const transporter = getTransporter();
 
-    // ✅ това ще каже дали SMTP изобщо е ОК
+    // ✅ проверка дали SMTP е ОК
     await transporter.verify();
     console.log("✅ SMTP verify OK");
 
@@ -482,9 +562,8 @@ function updatePasswordByEmail(email, newPassword) {
   return res.json(genericOk);
 });
 
-
 /**
- * POST /api/auth/reset-passwordgit add index.js
+ * POST /api/auth/reset-password
  * body: { token, newPassword }
  */
 app.post("/api/auth/reset-password", (req, res) => {
@@ -532,7 +611,6 @@ app.post("/api/ratings", requireUserAuth, (req, res) => {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
 
-  // Check already voted
   const existing = db
     .prepare("SELECT id FROM ratings WHERE userId = ? AND serviceId = ?")
     .get(userId, serviceId);
@@ -545,11 +623,14 @@ app.post("/api/ratings", requireUserAuth, (req, res) => {
   const createdAt = nowMs();
 
   try {
-    db.prepare(
-      "INSERT INTO ratings (id, userId, serviceId, value, createdAt) VALUES (?, ?, ?, ?, ?)"
-    ).run(id, userId, serviceId, value, createdAt);
+    db.prepare("INSERT INTO ratings (id, userId, serviceId, value, createdAt) VALUES (?, ?, ?, ?, ?)").run(
+      id,
+      userId,
+      serviceId,
+      value,
+      createdAt
+    );
   } catch (e) {
-    // In case UNIQUE triggers (race condition)
     if (String(e?.message || "").toLowerCase().includes("unique")) {
       return res.status(409).json({ ok: false, error: "ALREADY_VOTED" });
     }
@@ -557,10 +638,7 @@ app.post("/api/ratings", requireUserAuth, (req, res) => {
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 
-  // Return updated stats
-  const stats = db
-    .prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?")
-    .get(serviceId);
+  const stats = db.prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?").get(serviceId);
 
   return res.status(201).json({
     ok: true,
@@ -579,9 +657,7 @@ app.get("/api/ratings/stats/:serviceId", (req, res) => {
   const serviceId = String(req.params.serviceId || "").trim();
   if (!serviceId) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
 
-  const stats = db
-    .prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?")
-    .get(serviceId);
+  const stats = db.prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?").get(serviceId);
 
   return res.json({
     ok: true,
