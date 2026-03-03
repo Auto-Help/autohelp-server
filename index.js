@@ -9,6 +9,7 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const Database = require("better-sqlite3");
 const morgan = require("morgan");
+const fs = require("fs");
 
 const app = express();
 
@@ -1107,6 +1108,58 @@ app.get("/debug/stats", (req, res) => {
 
   res.json({ ok: true, users, companies, withLatLng, ratings, dbFile: DB_FILE, env: NODE_ENV });
 });
+
+
+
+// ако ползваш sqlite instance db, остави твоето db, само route-а добави.
+// Пример: const db = new sqlite3.Database(DB_FILE);
+
+function addDebugRoutes(app, db) {
+  const handler = (req, res) => {
+    const exists = fs.existsSync(DB_FILE);
+
+    db.all("SELECT COUNT(*) as cnt FROM companies", [], (err, rows) => {
+      if (err) {
+        return res.status(500).json({
+          ok: false,
+          dbFile: DB_FILE,
+          dbFileExists: exists,
+          error: err.message,
+        });
+      }
+
+      db.all(
+        "SELECT id, name, categoriesJson, createdAt FROM companies ORDER BY id DESC LIMIT 5",
+        [],
+        (err2, lastRows) => {
+          if (err2) {
+            return res.status(500).json({
+              ok: false,
+              dbFile: DB_FILE,
+              dbFileExists: exists,
+              companiesCount: rows?.[0]?.cnt ?? null,
+              error: err2.message,
+            });
+          }
+
+          res.json({
+            ok: true,
+            dbFile: DB_FILE,
+            dbFileExists: exists,
+            companiesCount: rows?.[0]?.cnt ?? null,
+            last5: lastRows || [],
+          });
+        }
+      );
+    });
+  };
+
+  app.get("/debug/stats", handler);
+  app.get("/api/debug/stats", handler);
+}
+
+// след като си създал app и db:
+addDebugRoutes(app, db);
 
 // ======================
 // START
