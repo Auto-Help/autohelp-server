@@ -201,7 +201,7 @@ function addColumnIfMissing(table, colDef) {
   }
 }
 
-// Companies location & working hours
+// Companies location & working hours (migration)
 try {
   addColumnIfMissing("companies", "lat REAL");
   addColumnIfMissing("companies", "lng REAL");
@@ -487,7 +487,20 @@ function msg(lang, key) {
 // ======================
 app.get("/", (req, res) => res.send("AutoHelp server is running ✅"));
 app.get("/health", (req, res) => {
-  res.json({ ok: true, env: NODE_ENV, hasSmtp: hasSmtp(), dbFile: DB_FILE, time: new Date().toISOString() });
+  const exists = fs.existsSync(DB_FILE);
+  let size = null;
+  try {
+    size = exists ? fs.statSync(DB_FILE).size : null;
+  } catch {}
+  res.json({
+    ok: true,
+    env: NODE_ENV,
+    hasSmtp: hasSmtp(),
+    dbFile: DB_FILE,
+    dbFileExists: exists,
+    dbFileSize: size,
+    time: new Date().toISOString(),
+  });
 });
 
 // ======================
@@ -593,7 +606,14 @@ app.post("/api/auth/login-user", rlLogin, (req, res) => {
   return res.json({
     ok: true,
     token,
-    user: { id: row.id, email: row.email, username: row.username, firstName: row.firstName, lastName: row.lastName, createdAt: row.createdAt },
+    user: {
+      id: row.id,
+      email: row.email,
+      username: row.username,
+      firstName: row.firstName,
+      lastName: row.lastName,
+      createdAt: row.createdAt,
+    },
   });
 });
 
@@ -751,7 +771,7 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-// Forgot password
+// Forgot/reset helpers
 function findAccountByEmail(email) {
   const e = normalizeEmail(email);
   const u = db.prepare("SELECT id, email FROM users WHERE email = ?").get(e);
@@ -953,71 +973,6 @@ app.get("/api/companies/nearby", (req, res) => {
   return res.json({ ok: true, items: out, category });
 });
 
-// Nearest
-app.get("/api/companies/nearest", (req, res) => {
-  const lat = Number(req.query.lat);
-  const lng = Number(req.query.lng);
-  const radiusKm = req.query.radiusKm ? Number(req.query.radiusKm) : DEFAULT_RADIUS_KM;
-  const categoryRaw = req.query.category ? String(req.query.category) : "";
-  const category = categoryRaw ? normalizeCategoryId(categoryRaw) : "";
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
-  }
-
-  const rows = db.prepare(`
-    SELECT
-      c.*,
-      COALESCE(r.avgRating, 0) as avgRating,
-      COALESCE(r.votes, 0) as votes
-    FROM companies c
-    LEFT JOIN (
-      SELECT serviceId, AVG(value) as avgRating, COUNT(*) as votes
-      FROM ratings
-      GROUP BY serviceId
-    ) r ON r.serviceId = c.id
-    WHERE c.lat IS NOT NULL AND c.lng IS NOT NULL
-  `).all();
-
-  const out = [];
-  for (const c of rows) {
-    const d = haversineKm(lat, lng, Number(c.lat), Number(c.lng));
-    if (Number.isFinite(radiusKm) && d > radiusKm) continue;
-
-    const cats = parseCategories(c.categoriesJson);
-    if (category && !cats.includes(category)) continue;
-
-    const openNow = isOpenNow(c.workingHoursJson);
-
-    out.push({
-      id: c.id,
-      companyName: c.companyName,
-      phone: c.phone,
-      address: c.address,
-      categories: cats,
-      lat: Number(c.lat),
-      lng: Number(c.lng),
-      distanceKm: Number(d.toFixed(2)),
-      openNow,
-      rating: {
-        average: Number(Number(c.avgRating || 0).toFixed(2)),
-        votes: Number(c.votes || 0),
-      },
-    });
-  }
-
-  out.sort((a, b) => {
-    const aOpen = a.openNow === true ? 1 : 0;
-    const bOpen = b.openNow === true ? 1 : 0;
-    if (aOpen !== bOpen) return bOpen - aOpen;
-    if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
-    if (a.rating.average !== b.rating.average) return b.rating.average - a.rating.average;
-    return b.rating.votes - a.rating.votes;
-  });
-
-  return res.json({ ok: true, item: out[0] || null, category });
-});
-
 // Company details
 app.get("/api/companies/:id", (req, res) => {
   const id = String(req.params.id || "").trim();
@@ -1099,67 +1054,39 @@ app.get("/api/ratings/stats/:serviceId", (req, res) => {
   return res.json({ ok: true, serviceId, average: Number(stats?.avg || 0), votes: Number(stats?.votes || 0) });
 });
 
-// Debug stats (за да не гадаем защо е празно)
-app.get("/debug/stats", (req, res) => {
+// ======================
+// ✅ DEBUG (single source of truth)
+// ======================
+app.get("/api/debug/db", (req, res) => {
+  const exists = fs.existsSync(DB_FILE);
+  let size = null;
+  try {
+    size = exists ? fs.statSync(DB_FILE).size : null;
+  } catch {}
+
   const users = db.prepare("SELECT COUNT(*) as n FROM users").get().n;
   const companies = db.prepare("SELECT COUNT(*) as n FROM companies").get().n;
   const withLatLng = db.prepare("SELECT COUNT(*) as n FROM companies WHERE lat IS NOT NULL AND lng IS NOT NULL").get().n;
   const ratings = db.prepare("SELECT COUNT(*) as n FROM ratings").get().n;
 
-  res.json({ ok: true, users, companies, withLatLng, ratings, dbFile: DB_FILE, env: NODE_ENV });
+  const last5 = db
+    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
+    .all()
+    .map((r) => ({ ...r, categories: parseCategories(r.categoriesJson) }));
+
+  res.json({
+    ok: true,
+    env: NODE_ENV,
+    dbFile: DB_FILE,
+    dbFileExists: exists,
+    dbFileSize: size,
+    users,
+    companies,
+    withLatLng,
+    ratings,
+    last5,
+  });
 });
-
-
-
-// ако ползваш sqlite instance db, остави твоето db, само route-а добави.
-// Пример: const db = new sqlite3.Database(DB_FILE);
-
-function addDebugRoutes(app, db) {
-  const handler = (req, res) => {
-    const exists = fs.existsSync(DB_FILE);
-
-    db.all("SELECT COUNT(*) as cnt FROM companies", [], (err, rows) => {
-      if (err) {
-        return res.status(500).json({
-          ok: false,
-          dbFile: DB_FILE,
-          dbFileExists: exists,
-          error: err.message,
-        });
-      }
-
-      db.all(
-        "SELECT id, name, categoriesJson, createdAt FROM companies ORDER BY id DESC LIMIT 5",
-        [],
-        (err2, lastRows) => {
-          if (err2) {
-            return res.status(500).json({
-              ok: false,
-              dbFile: DB_FILE,
-              dbFileExists: exists,
-              companiesCount: rows?.[0]?.cnt ?? null,
-              error: err2.message,
-            });
-          }
-
-          res.json({
-            ok: true,
-            dbFile: DB_FILE,
-            dbFileExists: exists,
-            companiesCount: rows?.[0]?.cnt ?? null,
-            last5: lastRows || [],
-          });
-        }
-      );
-    });
-  };
-
-  app.get("/debug/stats", handler);
-  app.get("/api/debug/stats", handler);
-}
-
-// след като си създал app и db:
-addDebugRoutes(app, db);
 
 // ======================
 // START
