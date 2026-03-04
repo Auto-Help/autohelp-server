@@ -11,6 +11,10 @@ const Database = require("better-sqlite3");
 const morgan = require("morgan");
 const fs = require("fs");
 
+// ✅ UPLOAD (Cloudinary)
+const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
+
 const app = express();
 
 // Body parsers
@@ -206,6 +210,8 @@ try {
   addColumnIfMissing("companies", "lat REAL");
   addColumnIfMissing("companies", "lng REAL");
   addColumnIfMissing("companies", "workingHoursJson TEXT");
+  addColumnIfMissing("companies", "logoUrl TEXT");
+  addColumnIfMissing("companies", "imagesJson TEXT"); // JSON string: ["url1","url2","url3"]
 } catch (e) {
   console.log("⚠️ Migration warning:", e?.message || e);
 }
@@ -216,6 +222,39 @@ setInterval(() => {
     db.prepare("DELETE FROM password_resets WHERE expiresAt <= ?").run(Date.now());
   } catch {}
 }, 5 * 60 * 1000).unref?.();
+
+// ======================
+// ✅ CLOUDINARY UPLOAD SETUP (FINAL)
+// ======================
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "",
+  api_key: process.env.CLOUDINARY_API_KEY || "",
+  api_secret: process.env.CLOUDINARY_API_SECRET || "",
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+function hasCloudinary() {
+  return !!(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+    process.env.CLOUDINARY_API_KEY &&
+    process.env.CLOUDINARY_API_SECRET
+  );
+}
+
+function bufferToDataUri(file) {
+  const b64 = file.buffer.toString("base64");
+  return `data:${file.mimetype};base64,${b64}`;
+}
+
+async function uploadToCloudinary(file, folder) {
+  const dataUri = bufferToDataUri(file);
+  const res = await cloudinary.uploader.upload(dataUri, {
+    folder,
+    resource_type: "image",
+  });
+  return res.secure_url;
+}
 
 // ======================
 // HELPERS
@@ -441,6 +480,15 @@ function parseCategories(categoriesJson) {
   }
 }
 
+function parseImages(imagesJson) {
+  try {
+    const arr = JSON.parse(imagesJson || "[]");
+    return Array.isArray(arr) ? arr.filter(Boolean).slice(0, 3) : [];
+  } catch {
+    return [];
+  }
+}
+
 function getRatingStatsByCompanyId(companyId) {
   const stats = db
     .prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?")
@@ -495,13 +543,67 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     env: NODE_ENV,
-    hasSmtp: hasSmtp(),
+    hasSmtp: !!(SMTP_HOST && SMTP_USER && SMTP_PASS && SMTP_FROM),
+    hasCloudinary: hasCloudinary(),
     dbFile: DB_FILE,
     dbFileExists: exists,
     dbFileSize: size,
     time: new Date().toISOString(),
   });
 });
+
+// ======================
+// ✅ UPLOAD MEDIA (logo + up to 3 images)
+// POST /api/company/upload-media
+// Fields: logo (1), images (up to 3)
+// Auth: company
+// ======================
+app.post(
+  "/api/company/upload-media",
+  requireCompanyAuth,
+  upload.fields([
+    { name: "logo", maxCount: 1 },
+    { name: "images", maxCount: 3 },
+  ]),
+  async (req, res) => {
+    try {
+      if (!hasCloudinary()) {
+        return res.status(500).json({ ok: false, error: "CLOUDINARY_NOT_CONFIGURED" });
+      }
+
+      const companyId = req.company.companyId;
+
+      const logoFile = req.files?.logo?.[0] || null;
+      const imageFiles = Array.isArray(req.files?.images) ? req.files.images : [];
+
+      let logoUrl = null;
+      const images = [];
+
+      if (logoFile) {
+        logoUrl = await uploadToCloudinary(logoFile, `autohelp/${companyId}/logo`);
+      }
+
+      for (const f of imageFiles.slice(0, 3)) {
+        const url = await uploadToCloudinary(f, `autohelp/${companyId}/images`);
+        images.push(url);
+      }
+
+      // запази в DB
+      db.prepare(
+        "UPDATE companies SET logoUrl = COALESCE(?, logoUrl), imagesJson = COALESCE(?, imagesJson) WHERE id = ?"
+      ).run(
+        logoUrl,
+        images.length ? JSON.stringify(images) : null,
+        companyId
+      );
+
+      return res.json({ ok: true, logoUrl, images });
+    } catch (e) {
+      console.error("upload-media error:", e?.message || e);
+      return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
+    }
+  }
+);
 
 // ======================
 // RESET PASSWORD LANDING PAGE
@@ -731,6 +833,8 @@ app.post("/api/auth/login-company", rlLogin, (req, res) => {
       lat: row.lat ?? null,
       lng: row.lng ?? null,
       workingHoursJson: row.workingHoursJson ?? null,
+      logoUrl: row.logoUrl ?? null,
+      images: parseImages(row.imagesJson),
       createdAt: row.createdAt,
     },
   });
@@ -889,6 +993,8 @@ app.get("/api/companies", (req, res) => {
       lng: c.lng ?? null,
       openNow,
       rating,
+      logoUrl: c.logoUrl ?? null,
+      images: parseImages(c.imagesJson),
       createdAt: c.createdAt,
     });
   }
@@ -958,6 +1064,8 @@ app.get("/api/companies/nearby", (req, res) => {
         average: Number(Number(c.avgRating || 0).toFixed(2)),
         votes: Number(c.votes || 0),
       },
+      logoUrl: c.logoUrl ?? null,
+      images: parseImages(c.imagesJson),
     });
   }
 
@@ -999,6 +1107,8 @@ app.get("/api/companies/:id", (req, res) => {
       workingHoursJson: c.workingHoursJson ?? null,
       openNow,
       rating,
+      logoUrl: c.logoUrl ?? null,
+      images: parseImages(c.imagesJson),
       createdAt: c.createdAt,
     },
   });
@@ -1070,9 +1180,9 @@ app.get("/api/debug/db", (req, res) => {
   const ratings = db.prepare("SELECT COUNT(*) as n FROM ratings").get().n;
 
   const last5 = db
-    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
+    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
     .all()
-    .map((r) => ({ ...r, categories: parseCategories(r.categoriesJson) }));
+    .map((r) => ({ ...r, categories: parseCategories(r.categoriesJson), images: parseImages(r.imagesJson) }));
 
   res.json({
     ok: true,
