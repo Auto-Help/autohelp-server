@@ -12,7 +12,7 @@ const morgan = require("morgan");
 const fs = require("fs");
 const path = require("path");
 
-// ✅ UPLOAD (LOCAL /data/uploads)
+// ✅ UPLOAD (LOCAL /data/uploads on Render Persistent Disk)
 const multer = require("multer");
 
 const app = express();
@@ -63,6 +63,9 @@ const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 
 // DB (Render: use /data + Persistent Disk)
 const DB_FILE = process.env.DB_FILE || "/data/autohelp.sqlite";
+
+// Uploads directory (Render persistent disk)
+const UPLOAD_DIR = process.env.UPLOAD_DIR || "/data/uploads";
 
 // Reset token config
 const RESET_TOKEN_TTL_MS = Number(process.env.RESET_TOKEN_TTL_MS || 30 * 60 * 1000); // 30 min
@@ -142,6 +145,78 @@ app.use(
 app.options("*", cors());
 
 // ======================
+// UPLOADS: ensure dir + serve static
+// ======================
+function ensureDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.error("❌ Cannot create upload dir:", dir, e?.message || e);
+  }
+}
+ensureDir(UPLOAD_DIR);
+
+// ✅ serve: https://your-server.onrender.com/uploads/<file>
+app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "7d", etag: true }));
+
+function hasUploads() {
+  try {
+    fs.accessSync(UPLOAD_DIR, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function extFromMime(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m === "image/jpeg") return ".jpg";
+  if (m === "image/png") return ".png";
+  if (m === "image/webp") return ".webp";
+  if (m === "image/gif") return ".gif";
+  if (m === "image/heic" || m === "image/heif") return ".heic";
+  return "";
+}
+
+function safeFileName(companyId, kind, originalName, mime) {
+  const rand = crypto.randomBytes(12).toString("hex");
+  const ext =
+    path.extname(String(originalName || "")).slice(0, 10) ||
+    extFromMime(mime) ||
+    ".bin";
+  return `${companyId}_${kind}_${Date.now()}_${rand}${ext}`;
+}
+
+// Multer disk storage
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const companyId = req.company?.companyId || "unknown";
+    const kind = file.fieldname === "logo" ? "logo" : "img";
+    cb(null, safeFileName(companyId, kind, file.originalname, file.mimetype));
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB per file
+  fileFilter: (req, file, cb) => {
+    const m = String(file.mimetype || "").toLowerCase();
+    if (
+      m === "image/jpeg" ||
+      m === "image/png" ||
+      m === "image/webp" ||
+      m === "image/gif" ||
+      m === "image/heic" ||
+      m === "image/heif"
+    ) {
+      return cb(null, true);
+    }
+    return cb(new Error("ONLY_IMAGES_ALLOWED"));
+  },
+});
+
+// ======================
 // DB INIT (SQLite)
 // ======================
 const db = new Database(DB_FILE);
@@ -205,7 +280,7 @@ function addColumnIfMissing(table, colDef) {
   }
 }
 
-// Companies location & working hours (migration)
+// Companies location & working hours & media (migration)
 try {
   addColumnIfMissing("companies", "lat REAL");
   addColumnIfMissing("companies", "lng REAL");
@@ -222,43 +297,6 @@ setInterval(() => {
     db.prepare("DELETE FROM password_resets WHERE expiresAt <= ?").run(Date.now());
   } catch {}
 }, 5 * 60 * 1000).unref?.();
-
-// ======================
-// ✅ UPLOADS (LOCAL /data/uploads) + PUBLIC URLS
-// ======================
-const UPLOAD_DIR =
-  process.env.UPLOAD_DIR || path.join(path.dirname(DB_FILE), "uploads");
-
-try {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-} catch (e) {
-  console.log("⚠️ Cannot create UPLOAD_DIR:", e?.message || e);
-}
-
-// serve files publicly: https://yourserver/uploads/<file>
-app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "7d" }));
-
-function safeExt(originalName) {
-  const ext = String(path.extname(originalName || "")).toLowerCase();
-  if ([".jpg", ".jpeg", ".png", ".webp"].includes(ext)) return ext;
-  return ".jpg";
-}
-
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-    filename: (req, file, cb) => {
-      const companyId = req.company?.companyId || "anon";
-      const ext = safeExt(file.originalname);
-      cb(null, `${companyId}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}${ext}`);
-    },
-  }),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
-  fileFilter: (req, file, cb) => {
-    const ok = ["image/jpeg", "image/png", "image/webp"].includes(file.mimetype);
-    cb(ok ? null : new Error("INVALID_FILE_TYPE"), ok);
-  },
-});
 
 // ======================
 // HELPERS
@@ -336,11 +374,6 @@ function getPublicBaseUrl(req) {
     .split(",")[0]
     .trim();
   return `${proto}://${host}`.replace(/\/+$/, "");
-}
-
-function publicFileUrl(req, filename) {
-  const base = getPublicBaseUrl(req);
-  return `${base}/uploads/${encodeURIComponent(filename)}`;
 }
 
 function normalizeDeepLinkBase(base) {
@@ -552,8 +585,8 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     env: NODE_ENV,
-    hasSmtp: !!(SMTP_HOST && SMTP_USER && SMTP_PASS && SMTP_FROM),
-    hasUploads: true,
+    hasSmtp: hasSmtp(),
+    hasUploads: hasUploads(),
     uploadDir: UPLOAD_DIR,
     dbFile: DB_FILE,
     dbFileExists: exists,
@@ -563,67 +596,62 @@ app.get("/health", (req, res) => {
 });
 
 // ======================
-// ✅ COMPANY UPLOADS (logo + up to 3 images)
+// ✅ UPLOAD MEDIA (logo + up to 3 images) - LOCAL
+// POST /api/company/upload-media
+// Fields: logo (1), images (up to 3)
+// Auth: company
+// Returns public URLs
 // ======================
+app.post(
+  "/api/company/upload-media",
+  requireCompanyAuth,
+  upload.fields([
+    { name: "logo", maxCount: 1 },
+    { name: "images", maxCount: 3 },
+  ]),
+  (req, res) => {
+    try {
+      if (!hasUploads()) {
+        return res.status(500).json({ ok: false, error: "UPLOADS_NOT_AVAILABLE" });
+      }
 
-// Upload / replace company logo
-app.post("/api/company/upload-logo", requireCompanyAuth, upload.single("logo"), (req, res) => {
-  if (!req.file?.filename) return res.status(400).json({ ok: false, error: "NO_FILE" });
+      const companyId = req.company.companyId;
+      const base = getPublicBaseUrl(req);
 
-  const companyId = req.company.companyId;
-  const url = publicFileUrl(req, req.file.filename);
+      const logoFile = req.files?.logo?.[0] || null;
+      const imageFiles = Array.isArray(req.files?.images) ? req.files.images : [];
 
-  db.prepare("UPDATE companies SET logoUrl = ? WHERE id = ?").run(url, companyId);
+      let logoUrl = null;
+      const images = [];
 
-  return res.json({ ok: true, logoUrl: url });
-});
+      if (logoFile?.filename) {
+        logoUrl = `${base}/uploads/${encodeURIComponent(logoFile.filename)}`;
+      }
 
-// Upload up to 3 images total (append until 3)
-app.post("/api/company/upload-images", requireCompanyAuth, upload.array("images", 3), (req, res) => {
-  const companyId = req.company.companyId;
-  const files = Array.isArray(req.files) ? req.files : [];
-  if (!files.length) return res.status(400).json({ ok: false, error: "NO_FILES" });
+      for (const f of imageFiles.slice(0, 3)) {
+        if (f?.filename) images.push(`${base}/uploads/${encodeURIComponent(f.filename)}`);
+      }
 
-  const row = db.prepare("SELECT imagesJson FROM companies WHERE id = ?").get(companyId);
-  let existing = [];
-  try {
-    existing = JSON.parse(row?.imagesJson || "[]");
-    if (!Array.isArray(existing)) existing = [];
-  } catch {
-    existing = [];
+      // ✅ запази в DB (замества с новите ако са подадени)
+      db.prepare(
+        "UPDATE companies SET logoUrl = COALESCE(?, logoUrl), imagesJson = COALESCE(?, imagesJson) WHERE id = ?"
+      ).run(
+        logoUrl,
+        images.length ? JSON.stringify(images) : null,
+        companyId
+      );
+
+      return res.json({ ok: true, logoUrl, images });
+    } catch (e) {
+      console.error("upload-media error:", e?.message || e);
+      const msg = String(e?.message || "");
+      if (msg.includes("ONLY_IMAGES_ALLOWED")) {
+        return res.status(400).json({ ok: false, error: "ONLY_IMAGES_ALLOWED" });
+      }
+      return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
+    }
   }
-
-  const added = files.map((f) => publicFileUrl(req, f.filename));
-  const merged = [...existing, ...added].slice(0, 3);
-
-  db.prepare("UPDATE companies SET imagesJson = ? WHERE id = ?").run(JSON.stringify(merged), companyId);
-
-  return res.json({ ok: true, images: merged });
-});
-
-// Remove image by index 0..2
-app.delete("/api/company/images/:index", requireCompanyAuth, (req, res) => {
-  const companyId = req.company.companyId;
-  const idx = Number(req.params.index);
-
-  if (!Number.isInteger(idx) || idx < 0 || idx > 2) {
-    return res.status(400).json({ ok: false, error: "INVALID_INDEX" });
-  }
-
-  const row = db.prepare("SELECT imagesJson FROM companies WHERE id = ?").get(companyId);
-  let arr = [];
-  try {
-    arr = JSON.parse(row?.imagesJson || "[]");
-    if (!Array.isArray(arr)) arr = [];
-  } catch {
-    arr = [];
-  }
-
-  arr.splice(idx, 1);
-  db.prepare("UPDATE companies SET imagesJson = ? WHERE id = ?").run(JSON.stringify(arr), companyId);
-
-  return res.json({ ok: true, images: arr });
-});
+);
 
 // ======================
 // RESET PASSWORD LANDING PAGE
@@ -739,7 +767,7 @@ app.post("/api/auth/login-user", rlLogin, (req, res) => {
   });
 });
 
-// Register company (stores categories normalized)
+// Register company
 app.post("/api/auth/register-company", (req, res) => {
   const {
     companyName = "",
@@ -1185,7 +1213,7 @@ app.get("/api/ratings/stats/:serviceId", (req, res) => {
 });
 
 // ======================
-// ✅ DEBUG (single source of truth)
+// ✅ DEBUG
 // ======================
 app.get("/api/debug/db", (req, res) => {
   const exists = fs.existsSync(DB_FILE);
@@ -1200,9 +1228,7 @@ app.get("/api/debug/db", (req, res) => {
   const ratings = db.prepare("SELECT COUNT(*) as n FROM ratings").get().n;
 
   const last5 = db
-    .prepare(
-      "SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5"
-    )
+    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
     .all()
     .map((r) => ({ ...r, categories: parseCategories(r.categoriesJson), images: parseImages(r.imagesJson) }));
 
@@ -1212,6 +1238,8 @@ app.get("/api/debug/db", (req, res) => {
     dbFile: DB_FILE,
     dbFileExists: exists,
     dbFileSize: size,
+    hasUploads: hasUploads(),
+    uploadDir: UPLOAD_DIR,
     users,
     companies,
     withLatLng,
