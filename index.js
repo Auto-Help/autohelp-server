@@ -10,10 +10,10 @@ const bcrypt = require("bcryptjs");
 const Database = require("better-sqlite3");
 const morgan = require("morgan");
 const fs = require("fs");
+const path = require("path");
 
-// ✅ UPLOAD (Cloudinary)
+// ✅ UPLOAD (LOCAL /data/uploads)
 const multer = require("multer");
-const cloudinary = require("cloudinary").v2;
 
 const app = express();
 
@@ -224,37 +224,41 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref?.();
 
 // ======================
-// ✅ CLOUDINARY UPLOAD SETUP (FINAL)
+// ✅ UPLOADS (LOCAL /data/uploads) + PUBLIC URLS
 // ======================
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "",
-  api_key: process.env.CLOUDINARY_API_KEY || "",
-  api_secret: process.env.CLOUDINARY_API_SECRET || "",
+const UPLOAD_DIR =
+  process.env.UPLOAD_DIR || path.join(path.dirname(DB_FILE), "uploads");
+
+try {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+} catch (e) {
+  console.log("⚠️ Cannot create UPLOAD_DIR:", e?.message || e);
+}
+
+// serve files publicly: https://yourserver/uploads/<file>
+app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "7d" }));
+
+function safeExt(originalName) {
+  const ext = String(path.extname(originalName || "")).toLowerCase();
+  if ([".jpg", ".jpeg", ".png", ".webp"].includes(ext)) return ext;
+  return ".jpg";
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    filename: (req, file, cb) => {
+      const companyId = req.company?.companyId || "anon";
+      const ext = safeExt(file.originalname);
+      cb(null, `${companyId}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}${ext}`);
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const ok = ["image/jpeg", "image/png", "image/webp"].includes(file.mimetype);
+    cb(ok ? null : new Error("INVALID_FILE_TYPE"), ok);
+  },
 });
-
-const upload = multer({ storage: multer.memoryStorage() });
-
-function hasCloudinary() {
-  return !!(
-    process.env.CLOUDINARY_CLOUD_NAME &&
-    process.env.CLOUDINARY_API_KEY &&
-    process.env.CLOUDINARY_API_SECRET
-  );
-}
-
-function bufferToDataUri(file) {
-  const b64 = file.buffer.toString("base64");
-  return `data:${file.mimetype};base64,${b64}`;
-}
-
-async function uploadToCloudinary(file, folder) {
-  const dataUri = bufferToDataUri(file);
-  const res = await cloudinary.uploader.upload(dataUri, {
-    folder,
-    resource_type: "image",
-  });
-  return res.secure_url;
-}
 
 // ======================
 // HELPERS
@@ -332,6 +336,11 @@ function getPublicBaseUrl(req) {
     .split(",")[0]
     .trim();
   return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
+function publicFileUrl(req, filename) {
+  const base = getPublicBaseUrl(req);
+  return `${base}/uploads/${encodeURIComponent(filename)}`;
 }
 
 function normalizeDeepLinkBase(base) {
@@ -544,7 +553,8 @@ app.get("/health", (req, res) => {
     ok: true,
     env: NODE_ENV,
     hasSmtp: !!(SMTP_HOST && SMTP_USER && SMTP_PASS && SMTP_FROM),
-    hasCloudinary: hasCloudinary(),
+    hasUploads: true,
+    uploadDir: UPLOAD_DIR,
     dbFile: DB_FILE,
     dbFileExists: exists,
     dbFileSize: size,
@@ -553,57 +563,67 @@ app.get("/health", (req, res) => {
 });
 
 // ======================
-// ✅ UPLOAD MEDIA (logo + up to 3 images)
-// POST /api/company/upload-media
-// Fields: logo (1), images (up to 3)
-// Auth: company
+// ✅ COMPANY UPLOADS (logo + up to 3 images)
 // ======================
-app.post(
-  "/api/company/upload-media",
-  requireCompanyAuth,
-  upload.fields([
-    { name: "logo", maxCount: 1 },
-    { name: "images", maxCount: 3 },
-  ]),
-  async (req, res) => {
-    try {
-      if (!hasCloudinary()) {
-        return res.status(500).json({ ok: false, error: "CLOUDINARY_NOT_CONFIGURED" });
-      }
 
-      const companyId = req.company.companyId;
+// Upload / replace company logo
+app.post("/api/company/upload-logo", requireCompanyAuth, upload.single("logo"), (req, res) => {
+  if (!req.file?.filename) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-      const logoFile = req.files?.logo?.[0] || null;
-      const imageFiles = Array.isArray(req.files?.images) ? req.files.images : [];
+  const companyId = req.company.companyId;
+  const url = publicFileUrl(req, req.file.filename);
 
-      let logoUrl = null;
-      const images = [];
+  db.prepare("UPDATE companies SET logoUrl = ? WHERE id = ?").run(url, companyId);
 
-      if (logoFile) {
-        logoUrl = await uploadToCloudinary(logoFile, `autohelp/${companyId}/logo`);
-      }
+  return res.json({ ok: true, logoUrl: url });
+});
 
-      for (const f of imageFiles.slice(0, 3)) {
-        const url = await uploadToCloudinary(f, `autohelp/${companyId}/images`);
-        images.push(url);
-      }
+// Upload up to 3 images total (append until 3)
+app.post("/api/company/upload-images", requireCompanyAuth, upload.array("images", 3), (req, res) => {
+  const companyId = req.company.companyId;
+  const files = Array.isArray(req.files) ? req.files : [];
+  if (!files.length) return res.status(400).json({ ok: false, error: "NO_FILES" });
 
-      // запази в DB
-      db.prepare(
-        "UPDATE companies SET logoUrl = COALESCE(?, logoUrl), imagesJson = COALESCE(?, imagesJson) WHERE id = ?"
-      ).run(
-        logoUrl,
-        images.length ? JSON.stringify(images) : null,
-        companyId
-      );
-
-      return res.json({ ok: true, logoUrl, images });
-    } catch (e) {
-      console.error("upload-media error:", e?.message || e);
-      return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
-    }
+  const row = db.prepare("SELECT imagesJson FROM companies WHERE id = ?").get(companyId);
+  let existing = [];
+  try {
+    existing = JSON.parse(row?.imagesJson || "[]");
+    if (!Array.isArray(existing)) existing = [];
+  } catch {
+    existing = [];
   }
-);
+
+  const added = files.map((f) => publicFileUrl(req, f.filename));
+  const merged = [...existing, ...added].slice(0, 3);
+
+  db.prepare("UPDATE companies SET imagesJson = ? WHERE id = ?").run(JSON.stringify(merged), companyId);
+
+  return res.json({ ok: true, images: merged });
+});
+
+// Remove image by index 0..2
+app.delete("/api/company/images/:index", requireCompanyAuth, (req, res) => {
+  const companyId = req.company.companyId;
+  const idx = Number(req.params.index);
+
+  if (!Number.isInteger(idx) || idx < 0 || idx > 2) {
+    return res.status(400).json({ ok: false, error: "INVALID_INDEX" });
+  }
+
+  const row = db.prepare("SELECT imagesJson FROM companies WHERE id = ?").get(companyId);
+  let arr = [];
+  try {
+    arr = JSON.parse(row?.imagesJson || "[]");
+    if (!Array.isArray(arr)) arr = [];
+  } catch {
+    arr = [];
+  }
+
+  arr.splice(idx, 1);
+  db.prepare("UPDATE companies SET imagesJson = ? WHERE id = ?").run(JSON.stringify(arr), companyId);
+
+  return res.json({ ok: true, images: arr });
+});
 
 // ======================
 // RESET PASSWORD LANDING PAGE
@@ -1180,7 +1200,9 @@ app.get("/api/debug/db", (req, res) => {
   const ratings = db.prepare("SELECT COUNT(*) as n FROM ratings").get().n;
 
   const last5 = db
-    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
+    .prepare(
+      "SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5"
+    )
     .all()
     .map((r) => ({ ...r, categories: parseCategories(r.categoriesJson), images: parseImages(r.imagesJson) }));
 
