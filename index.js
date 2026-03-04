@@ -287,6 +287,9 @@ try {
   addColumnIfMissing("companies", "workingHoursJson TEXT");
   addColumnIfMissing("companies", "logoUrl TEXT");
   addColumnIfMissing("companies", "imagesJson TEXT"); // JSON string: ["url1","url2","url3"]
+
+  // ✅ NEW: services text (What do you offer?)
+  addColumnIfMissing("companies", "servicesText TEXT");
 } catch (e) {
   console.log("⚠️ Migration warning:", e?.message || e);
 }
@@ -833,6 +836,12 @@ app.post("/api/auth/register-company", (req, res) => {
     vals.push(workingHoursJson ? String(workingHoursJson) : null);
   }
 
+  // ✅ NEW: servicesText column exists? Insert empty default (safe)
+  if (hasColumn("companies", "servicesText")) {
+    cols.push("servicesText");
+    vals.push("");
+  }
+
   const placeholders = cols.map(() => "?").join(", ");
   db.prepare(`INSERT INTO companies (${cols.join(", ")}) VALUES (${placeholders})`).run(...vals);
 
@@ -851,6 +860,8 @@ app.post("/api/auth/register-company", (req, res) => {
       lat: Number.isFinite(latNum) ? latNum : null,
       lng: Number.isFinite(lngNum) ? lngNum : null,
       createdAt,
+      // ✅ NEW
+      servicesText: "",
     },
   });
 });
@@ -883,6 +894,8 @@ app.post("/api/auth/login-company", rlLogin, (req, res) => {
       workingHoursJson: row.workingHoursJson ?? null,
       logoUrl: row.logoUrl ?? null,
       images: parseImages(row.imagesJson),
+      // ✅ NEW
+      servicesText: typeof row.servicesText === "string" ? row.servicesText : "",
       createdAt: row.createdAt,
     },
   });
@@ -895,6 +908,17 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
   const lat = req.body?.lat;
   const lng = req.body?.lng;
   const workingHoursJson = req.body?.workingHoursJson;
+
+  // ✅ NEW
+  const servicesTextRaw = req.body?.servicesText;
+  const servicesText = typeof servicesTextRaw === "string" ? servicesTextRaw : undefined;
+
+  // ✅ NEW (dashboard already sends them)
+  const logoUrlRaw = req.body?.logoUrl;
+  const logoUrl = typeof logoUrlRaw === "string" ? logoUrlRaw : undefined;
+
+  const imagesJsonRaw = req.body?.imagesJson;
+  const imagesJson = typeof imagesJsonRaw === "string" ? imagesJsonRaw : undefined;
 
   const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
   const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
@@ -913,6 +937,22 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
   if (hasColumn("companies", "workingHoursJson") && workingHoursJson !== undefined) {
     sets.push("workingHoursJson = ?");
     vals.push(workingHoursJson ? String(workingHoursJson) : null);
+  }
+
+  // ✅ NEW: save servicesText
+  if (hasColumn("companies", "servicesText") && servicesText !== undefined) {
+    sets.push("servicesText = ?");
+    vals.push(String(servicesText));
+  }
+
+  // ✅ NEW: allow update of logoUrl/imagesJson via update-profile too (safe)
+  if (hasColumn("companies", "logoUrl") && logoUrl !== undefined) {
+    sets.push("logoUrl = ?");
+    vals.push(String(logoUrl));
+  }
+  if (hasColumn("companies", "imagesJson") && imagesJson !== undefined) {
+    sets.push("imagesJson = ?");
+    vals.push(String(imagesJson));
   }
 
   if (!sets.length) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
@@ -1043,6 +1083,8 @@ app.get("/api/companies", (req, res) => {
       rating,
       logoUrl: c.logoUrl ?? null,
       images: parseImages(c.imagesJson),
+      // ✅ NEW
+      servicesText: typeof c.servicesText === "string" ? c.servicesText : "",
       createdAt: c.createdAt,
     });
   }
@@ -1114,6 +1156,8 @@ app.get("/api/companies/nearby", (req, res) => {
       },
       logoUrl: c.logoUrl ?? null,
       images: parseImages(c.imagesJson),
+      // ✅ NEW
+      servicesText: typeof c.servicesText === "string" ? c.servicesText : "",
     });
   }
 
@@ -1157,6 +1201,8 @@ app.get("/api/companies/:id", (req, res) => {
       rating,
       logoUrl: c.logoUrl ?? null,
       images: parseImages(c.imagesJson),
+      // ✅ NEW
+      servicesText: typeof c.servicesText === "string" ? c.servicesText : "",
       createdAt: c.createdAt,
     },
   });
@@ -1228,9 +1274,14 @@ app.get("/api/debug/db", (req, res) => {
   const ratings = db.prepare("SELECT COUNT(*) as n FROM ratings").get().n;
 
   const last5 = db
-    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
+    .prepare("SELECT id, email, companyName, categoriesJson, lat, lng, logoUrl, imagesJson, servicesText, createdAt FROM companies ORDER BY createdAt DESC LIMIT 5")
     .all()
-    .map((r) => ({ ...r, categories: parseCategories(r.categoriesJson), images: parseImages(r.imagesJson) }));
+    .map((r) => ({
+      ...r,
+      categories: parseCategories(r.categoriesJson),
+      images: parseImages(r.imagesJson),
+      servicesText: typeof r.servicesText === "string" ? r.servicesText : "",
+    }));
 
   res.json({
     ok: true,
