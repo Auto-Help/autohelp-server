@@ -120,28 +120,43 @@ const rlReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix
 // ======================
 // CORS
 // ======================
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // native apps / some webviews send no Origin
+
+  const o = String(origin).trim();
+
+  // Allow Capacitor/Ionic app origins (important for iOS/Android WebView)
+  if (o === "capacitor://localhost") return true;
+  if (o === "ionic://localhost") return true;
+
+  // Allow Render preview / localhost in dev
+  if (!IS_PROD) {
+    if (o.startsWith("http://localhost:")) return true;
+    if (o.startsWith("http://127.0.0.1:")) return true;
+    if (o.startsWith("https://localhost:")) return true;
+  }
+
+  // Allow configured WEB_ORIGIN exact match (web app)
+  if (WEB_ORIGIN && (WEB_ORIGIN.startsWith("http://") || WEB_ORIGIN.startsWith("https://"))) {
+    return o === WEB_ORIGIN;
+  }
+
+  return false;
+}
+
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-
-      if (WEB_ORIGIN && (WEB_ORIGIN.startsWith("http://") || WEB_ORIGIN.startsWith("https://"))) {
-        if (origin === WEB_ORIGIN) return cb(null, true);
-      }
-
-      // dev
-      if (!IS_PROD) {
-        if (origin.startsWith("http://localhost:")) return cb(null, true);
-        if (origin.startsWith("http://127.0.0.1:")) return cb(null, true);
-      }
-
-      return cb(null, false);
+      if (isAllowedOrigin(origin)) return cb(null, true);
+      return cb(new Error("CORS_NOT_ALLOWED"), false);
     },
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   })
 );
+
+// Preflight
 app.options("*", cors());
 
 // ======================
@@ -597,6 +612,15 @@ app.get("/health", (req, res) => {
     time: new Date().toISOString(),
   });
 });
+app.get("/api/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: "up",
+    env: NODE_ENV,
+    time: new Date().toISOString(),
+  });
+});
+app.head("/api/health", (req, res) => res.sendStatus(200));
 
 // ======================
 // ✅ UPLOAD MEDIA (logo + up to 3 images) - LOCAL
