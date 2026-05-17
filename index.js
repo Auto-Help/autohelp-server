@@ -128,6 +128,8 @@ function isAllowedOrigin(origin) {
   // Allow Capacitor/Ionic app origins (important for iOS/Android WebView)
   if (o === "capacitor://localhost") return true;
   if (o === "ionic://localhost") return true;
+  if (o === "http://localhost") return true;
+  if (o === "https://localhost") return true;
 
   // Allow Render preview / localhost in dev
   if (!IS_PROD) {
