@@ -6,7 +6,7 @@ const crypto = require("crypto");
 
 module.exports = function createAuthRouter(db) {
   const router = express.Router();
-  const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+  const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_ME_DEV_SECRET";
 
   const signToken = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
 

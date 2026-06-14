@@ -113,9 +113,10 @@ function createRateLimiter({ windowMs, max, keyPrefix }) {
   };
 }
 
-const rlLogin = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "login" });
-const rlForgot = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5, keyPrefix: "forgot" });
-const rlReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "reset" });
+const rlLogin    = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "login" });
+const rlForgot   = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5,  keyPrefix: "forgot" });
+const rlReset    = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "reset" });
+const rlRegister = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "register" });
 
 // ======================
 // CORS
@@ -284,6 +285,20 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_password_resets_expiresAt ON password_resets(expiresAt);
   CREATE INDEX IF NOT EXISTS idx_password_resets_account ON password_resets(accountType, accountId);
+
+  CREATE TABLE IF NOT EXISTS vehicles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    make            TEXT,
+    model           TEXT,
+    reg_month       INTEGER,
+    reg_year        INTEGER,
+    gtp_custom_data TEXT,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_vehicles_user_id ON vehicles(user_id);
 `);
 
 function hasColumn(table, col) {
@@ -307,6 +322,10 @@ try {
 
   // ✅ NEW: services text (What do you offer?)
   addColumnIfMissing("companies", "servicesText TEXT");
+
+  // ✅ NEW: profile view counter
+  addColumnIfMissing("companies", "viewCount INTEGER DEFAULT 0");
+  addColumnIfMissing("companies", "callCount INTEGER DEFAULT 0");
 } catch (e) {
   console.log("⚠️ Migration warning:", e?.message || e);
 }
@@ -661,16 +680,32 @@ app.post(
         if (f?.filename) images.push(`${base}/uploads/${encodeURIComponent(f.filename)}`);
       }
 
-      // ✅ запази в DB (замества с новите ако са подадени)
+      // merge нови снимки със съществуващите (max 3, без дублиране)
+      const existingRow = db.prepare("SELECT imagesJson FROM companies WHERE id = ?").get(companyId);
+      let existingImages = [];
+      try {
+        const parsed = JSON.parse(existingRow?.imagesJson || "[]");
+        if (Array.isArray(parsed)) existingImages = parsed.map(String).filter(Boolean);
+      } catch {}
+
+      const seen = new Set();
+      const mergedImages = [];
+      for (const url of [...existingImages, ...images]) {
+        if (url && !seen.has(url) && mergedImages.length < 3) {
+          seen.add(url);
+          mergedImages.push(url);
+        }
+      }
+
       db.prepare(
-        "UPDATE companies SET logoUrl = COALESCE(?, logoUrl), imagesJson = COALESCE(?, imagesJson) WHERE id = ?"
+        "UPDATE companies SET logoUrl = COALESCE(?, logoUrl), imagesJson = ? WHERE id = ?"
       ).run(
         logoUrl,
-        images.length ? JSON.stringify(images) : null,
+        JSON.stringify(mergedImages),
         companyId
       );
 
-      return res.json({ ok: true, logoUrl, images });
+      return res.json({ ok: true, logoUrl, images: mergedImages });
     } catch (e) {
       console.error("upload-media error:", e?.message || e);
       const msg = String(e?.message || "");
@@ -734,8 +769,9 @@ ${expoGoLink ? `setTimeout(() => { window.location.href = "${expoGoLink}"; }, 90
 // ======================
 // AUTH
 // ======================
-app.post("/api/auth/register-user", (req, res) => {
-  const { firstName = "", lastName = "", username = "", email = "", password = "" } = req.body || {};
+app.post("/api/auth/register-user", rlRegister, (req, res) => {
+  const { firstName = "", lastName = "", username = "", email = "", password = "",
+          car_make, car_model, car_reg_month, car_reg_year } = req.body || {};
   const e = normalizeEmail(email);
   const u = String(username).trim();
   const fn = String(firstName).trim();
@@ -758,6 +794,16 @@ app.post("/api/auth/register-user", (req, res) => {
   db.prepare(
     "INSERT INTO users (id, email, username, firstName, lastName, passwordHash, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)"
   ).run(id, e, u, fn, ln, passwordHash, createdAt);
+
+  // Optional vehicle — create only if at least one field is provided
+  const carMake = String(car_make || "").trim();
+  const carModel = String(car_model || "").trim();
+  const carMonth = car_reg_month ? Number(car_reg_month) : null;
+  const carYear = car_reg_year ? Number(car_reg_year) : null;
+  if (carMake || carModel || carMonth || carYear) {
+    db.prepare("INSERT INTO vehicles (user_id, make, model, reg_month, reg_year) VALUES (?, ?, ?, ?, ?)")
+      .run(id, carMake || null, carModel || null, carMonth, carYear);
+  }
 
   const token = signToken({ type: "user", userId: id });
 
@@ -797,7 +843,7 @@ app.post("/api/auth/login-user", rlLogin, (req, res) => {
 });
 
 // Register company
-app.post("/api/auth/register-company", (req, res) => {
+app.post("/api/auth/register-company", rlRegister, (req, res) => {
   const {
     companyName = "",
     phone = "",
@@ -893,11 +939,17 @@ app.post("/api/auth/register-company", (req, res) => {
 });
 
 app.post("/api/auth/login-company", rlLogin, (req, res) => {
-  const email = normalizeEmail(req.body?.email);
+  const identifier = String(req.body?.email || "").trim();
   const password = String(req.body?.password || "");
-  if (!email || !password) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  if (!identifier || !password) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
 
-  const row = db.prepare("SELECT * FROM companies WHERE email = ?").get(email);
+  let row;
+  if (identifier.includes("@")) {
+    row = db.prepare("SELECT * FROM companies WHERE email = ?").get(identifier.toLowerCase());
+  } else {
+    const rows = db.prepare("SELECT * FROM companies WHERE companyName = ?").all(identifier);
+    row = rows.length === 1 ? rows[0] : null;
+  }
   if (!row) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
 
   const ok = bcrypt.compareSync(password, row.passwordHash);
@@ -935,16 +987,37 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
   const lng = req.body?.lng;
   const workingHoursJson = req.body?.workingHoursJson;
 
-  // ✅ NEW
   const servicesTextRaw = req.body?.servicesText;
   const servicesText = typeof servicesTextRaw === "string" ? servicesTextRaw : undefined;
 
-  // ✅ NEW (dashboard already sends them)
   const logoUrlRaw = req.body?.logoUrl;
   const logoUrl = typeof logoUrlRaw === "string" ? logoUrlRaw : undefined;
 
   const imagesJsonRaw = req.body?.imagesJson;
   const imagesJson = typeof imagesJsonRaw === "string" ? imagesJsonRaw : undefined;
+
+  const companyNameRaw = req.body?.companyName;
+  const companyName = typeof companyNameRaw === "string" && companyNameRaw.trim() ? companyNameRaw.trim() : undefined;
+
+  const phoneRaw = req.body?.phone;
+  const phone = typeof phoneRaw === "string" && phoneRaw.trim() ? phoneRaw.trim() : undefined;
+
+  const addressRaw = req.body?.address;
+  const address = typeof addressRaw === "string" && addressRaw.trim() ? addressRaw.trim() : undefined;
+
+  const emailRaw = req.body?.email;
+  const emailNew = typeof emailRaw === "string" && emailRaw.trim() ? normalizeEmail(emailRaw) : undefined;
+
+  // Check email uniqueness only if email is being changed
+  if (emailNew !== undefined) {
+    const current = db.prepare("SELECT email FROM companies WHERE id = ?").get(companyId);
+    if (current && normalizeEmail(current.email) !== emailNew) {
+      const taken =
+        db.prepare("SELECT 1 FROM companies WHERE email = ? AND id != ?").get(emailNew, companyId) ||
+        db.prepare("SELECT 1 FROM users WHERE email = ?").get(emailNew);
+      if (taken) return res.status(409).json({ ok: false, error: "EMAIL_EXISTS" });
+    }
+  }
 
   const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
   const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
@@ -971,7 +1044,6 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
     vals.push(String(servicesText));
   }
 
-  // ✅ NEW: allow update of logoUrl/imagesJson via update-profile too (safe)
   if (hasColumn("companies", "logoUrl") && logoUrl !== undefined) {
     sets.push("logoUrl = ?");
     vals.push(String(logoUrl));
@@ -979,6 +1051,23 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
   if (hasColumn("companies", "imagesJson") && imagesJson !== undefined) {
     sets.push("imagesJson = ?");
     vals.push(String(imagesJson));
+  }
+
+  if (companyName !== undefined) {
+    sets.push("companyName = ?");
+    vals.push(companyName);
+  }
+  if (phone !== undefined) {
+    sets.push("phone = ?");
+    vals.push(phone);
+  }
+  if (address !== undefined) {
+    sets.push("address = ?");
+    vals.push(address);
+  }
+  if (emailNew !== undefined) {
+    sets.push("email = ?");
+    vals.push(emailNew);
   }
 
   if (!sets.length) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
@@ -1079,12 +1168,61 @@ app.post("/api/auth/reset-password", rlReset, (req, res) => {
 });
 
 // ======================
+// DELETE ACCOUNT
+// ======================
+app.delete("/api/auth/delete-user", requireUserAuth, (req, res) => {
+  const userId = req.user.userId;
+
+  const deleteAccount = db.transaction(() => {
+    db.prepare("DELETE FROM password_resets WHERE accountType = 'user' AND accountId = ?").run(userId);
+    db.prepare("DELETE FROM ratings WHERE userId = ?").run(userId);
+    db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+  });
+
+  try {
+    deleteAccount();
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("delete-user error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+app.delete("/api/auth/delete-company", requireCompanyAuth, (req, res) => {
+  const companyId = req.company.companyId;
+
+  const deleteAccount = db.transaction(() => {
+    db.prepare("DELETE FROM password_resets WHERE accountType = 'company' AND accountId = ?").run(companyId);
+    db.prepare("DELETE FROM ratings WHERE serviceId = ?").run(companyId);
+    db.prepare("DELETE FROM companies WHERE id = ?").run(companyId);
+  });
+
+  try {
+    deleteAccount();
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("delete-company error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+// ======================
 // ✅ COMPANIES LIST
-// GET /api/companies?category=inspection
+// GET /api/companies?category=inspection&page=1&limit=20&lat=48.2&lng=16.3&radiusKm=30
 // ======================
 app.get("/api/companies", (req, res) => {
   const categoryRaw = req.query.category ? String(req.query.category) : "";
   const category = categoryRaw ? normalizeCategoryId(categoryRaw) : "";
+
+  const page  = Math.max(1, parseInt(req.query.page)  || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+
+  // Radius params — optional. If not provided, behaviour is identical to before.
+  const userLat   = req.query.lat      ? Number(req.query.lat)      : null;
+  const userLng   = req.query.lng      ? Number(req.query.lng)      : null;
+  const radiusKm  = req.query.radiusKm ? Number(req.query.radiusKm) : null;
+  const hasUserPos = Number.isFinite(userLat) && Number.isFinite(userLng);
+  const useRadius  = hasUserPos && Number.isFinite(radiusKm) && radiusKm > 0;
 
   const rows = db.prepare(`SELECT * FROM companies`).all();
 
@@ -1093,8 +1231,24 @@ app.get("/api/companies", (req, res) => {
     const cats = parseCategories(c.categoriesJson);
     if (category && !cats.includes(category)) continue;
 
+    const companyLat = typeof c.lat === "number" ? c.lat : null;
+    const companyLng = typeof c.lng === "number" ? c.lng : null;
+    const hasCoords  = companyLat !== null && companyLng !== null;
+
+    // Radius mode: companies without coordinates are excluded
+    if (useRadius && !hasCoords) continue;
+
+    // Calculate distance if user position is known
+    let distanceKm = null;
+    if (hasUserPos && hasCoords) {
+      distanceKm = haversineKm(userLat, userLng, companyLat, companyLng);
+    }
+
+    // Radius filter: exclude companies beyond the selected radius
+    if (useRadius && distanceKm > radiusKm) continue;
+
     const openNow = isOpenNow(c.workingHoursJson);
-    const rating = getRatingStatsByCompanyId(c.id);
+    const rating  = getRatingStatsByCompanyId(c.id);
 
     items.push({
       id: c.id,
@@ -1103,28 +1257,53 @@ app.get("/api/companies", (req, res) => {
       phone: c.phone,
       address: c.address,
       categories: cats,
-      lat: c.lat ?? null,
-      lng: c.lng ?? null,
+      lat: companyLat,
+      lng: companyLng,
       openNow,
+      distanceKm,
       rating,
       logoUrl: c.logoUrl ?? null,
       images: parseImages(c.imagesJson),
-      // ✅ NEW
       servicesText: typeof c.servicesText === "string" ? c.servicesText : "",
       createdAt: c.createdAt,
     });
   }
 
   items.sort((a, b) => {
+    // 1. Open first
     const aOpen = a.openNow === true ? 1 : 0;
     const bOpen = b.openNow === true ? 1 : 0;
     if (aOpen !== bOpen) return bOpen - aOpen;
+
+    // 2. Distance (only when user position is known)
+    if (hasUserPos) {
+      const ad = typeof a.distanceKm === "number" ? a.distanceKm : Infinity;
+      const bd = typeof b.distanceKm === "number" ? b.distanceKm : Infinity;
+      if (ad !== bd) return ad - bd;
+    }
+
+    // 3. Rating
     if (a.rating.average !== b.rating.average) return b.rating.average - a.rating.average;
-    if (a.rating.votes !== b.rating.votes) return b.rating.votes - a.rating.votes;
+    if (a.rating.votes   !== b.rating.votes)   return b.rating.votes   - a.rating.votes;
+
     return Number(b.createdAt || 0) - Number(a.createdAt || 0);
   });
 
-  return res.json({ ok: true, items, category });
+  const total      = items.length;
+  const totalPages = Math.ceil(total / limit);
+  const paginated  = items.slice((page - 1) * limit, page * limit);
+
+  return res.json({
+    ok: true,
+    items: paginated,
+    category,
+    page,
+    limit,
+    total,
+    totalPages,
+    hasMore: page < totalPages,
+    radiusKm: useRadius ? radiusKm : null,
+  });
 });
 
 // ======================
@@ -1280,14 +1459,47 @@ app.get("/api/ratings/stats/:serviceId", (req, res) => {
   if (!serviceId) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
 
   const stats = db.prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?").get(serviceId);
+  const company = db.prepare("SELECT viewCount, callCount FROM companies WHERE id = ?").get(serviceId);
 
-  return res.json({ ok: true, serviceId, average: Number(stats?.avg || 0), votes: Number(stats?.votes || 0) });
+  return res.json({
+    ok: true,
+    serviceId,
+    average: Number(stats?.avg || 0),
+    votes: Number(stats?.votes || 0),
+    views: Number(company?.viewCount || 0),
+    calls: Number(company?.callCount || 0),
+  });
+});
+
+// ✅ Track profile view (called from ServiceDetail on open)
+app.post("/api/companies/:id/view", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+
+  const company = db.prepare("SELECT id FROM companies WHERE id = ?").get(id);
+  if (!company) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+  db.prepare("UPDATE companies SET viewCount = COALESCE(viewCount, 0) + 1 WHERE id = ?").run(id);
+  const updated = db.prepare("SELECT viewCount FROM companies WHERE id = ?").get(id);
+
+  return res.json({ ok: true, views: Number(updated?.viewCount || 0) });
+});
+
+app.post("/api/companies/:id/call", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  const company = db.prepare("SELECT id FROM companies WHERE id = ?").get(id);
+  if (!company) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  db.prepare("UPDATE companies SET callCount = COALESCE(callCount, 0) + 1 WHERE id = ?").run(id);
+  const updated = db.prepare("SELECT callCount FROM companies WHERE id = ?").get(id);
+  return res.json({ ok: true, calls: Number(updated?.callCount || 0) });
 });
 
 // ======================
-// ✅ DEBUG
+// ✅ DEBUG (dev only)
 // ======================
 app.get("/api/debug/db", (req, res) => {
+  if (IS_PROD) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   const exists = fs.existsSync(DB_FILE);
   let size = null;
   try {
@@ -1323,6 +1535,110 @@ app.get("/api/debug/db", (req, res) => {
     ratings,
     last5,
   });
+});
+
+// ======================
+// USER PROFILE & VEHICLES
+// ======================
+
+// GET /api/user/me — профил на логнатия потребител
+app.get("/api/user/me", requireUserAuth, (req, res) => {
+  const user = db.prepare("SELECT id, firstName, lastName, username, email FROM users WHERE id = ?").get(req.user.userId);
+  if (!user) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  return res.json({ ok: true, user });
+});
+
+// PUT /api/user/me — смяна на имейл
+app.put("/api/user/me", requireUserAuth, (req, res) => {
+  const email = normalizeEmail(req.body.email || "");
+  if (!email) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+
+  const existing = db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, req.user.userId);
+  if (existing) return res.status(409).json({ ok: false, error: "EMAIL_EXISTS" });
+
+  db.prepare("UPDATE users SET email = ? WHERE id = ?").run(email, req.user.userId);
+  return res.json({ ok: true });
+});
+
+// PUT /api/user/password — смяна на парола
+app.put("/api/user/password", requireUserAuth, (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  if (String(newPassword).length < 6) return res.status(400).json({ ok: false, error: "PASS_TOO_SHORT" });
+
+  const user = db.prepare("SELECT passwordHash FROM users WHERE id = ?").get(req.user.userId);
+  if (!user) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+  const match = bcrypt.compareSync(String(currentPassword), user.passwordHash);
+  if (!match) return res.status(401).json({ ok: false, error: "WRONG_PASSWORD" });
+
+  const hashed = bcrypt.hashSync(String(newPassword), 10);
+  db.prepare("UPDATE users SET passwordHash = ? WHERE id = ?").run(hashed, req.user.userId);
+  return res.json({ ok: true });
+});
+
+// GET /api/user/vehicles — всички автомобили на потребителя
+app.get("/api/user/vehicles", requireUserAuth, (req, res) => {
+  const vehicles = db.prepare("SELECT * FROM vehicles WHERE user_id = ? ORDER BY created_at ASC").all(req.user.userId);
+  return res.json({ ok: true, vehicles });
+});
+
+// POST /api/user/vehicles — добавяне на нов автомобил
+app.post("/api/user/vehicles", requireUserAuth, (req, res) => {
+  const { make, model, reg_month, reg_year } = req.body;
+  const makeStr = String(make || "").trim();
+  const modelStr = String(model || "").trim();
+  const month = reg_month ? Number(reg_month) : null;
+  const year = reg_year ? Number(reg_year) : null;
+
+  if (month !== null && (month < 1 || month > 12)) return res.status(400).json({ ok: false, error: "INVALID_MONTH" });
+  if (year !== null && (year < 1900 || year > new Date().getFullYear())) return res.status(400).json({ ok: false, error: "INVALID_YEAR" });
+
+  const result = db.prepare(
+    "INSERT INTO vehicles (user_id, make, model, reg_month, reg_year) VALUES (?, ?, ?, ?, ?)"
+  ).run(req.user.userId, makeStr || null, modelStr || null, month, year);
+
+  const vehicle = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(result.lastInsertRowid);
+  return res.status(201).json({ ok: true, vehicle });
+});
+
+// PUT /api/user/vehicles/:id — редактиране на автомобил
+app.put("/api/user/vehicles/:id", requireUserAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+
+  const vehicle = db.prepare("SELECT id, user_id FROM vehicles WHERE id = ?").get(id);
+  if (!vehicle) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  if (vehicle.user_id !== req.user.userId) return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+
+  const { make, model, reg_month, reg_year } = req.body;
+  const makeStr = String(make || "").trim();
+  const modelStr = String(model || "").trim();
+  const month = reg_month ? Number(reg_month) : null;
+  const year = reg_year ? Number(reg_year) : null;
+
+  if (month !== null && (month < 1 || month > 12)) return res.status(400).json({ ok: false, error: "INVALID_MONTH" });
+  if (year !== null && (year < 1900 || year > new Date().getFullYear())) return res.status(400).json({ ok: false, error: "INVALID_YEAR" });
+
+  db.prepare(
+    "UPDATE vehicles SET make = ?, model = ?, reg_month = ?, reg_year = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+  ).run(makeStr || null, modelStr || null, month, year, id);
+
+  const updated = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(id);
+  return res.json({ ok: true, vehicle: updated });
+});
+
+// DELETE /api/user/vehicles/:id — изтриване (готов за Фаза 2+)
+app.delete("/api/user/vehicles/:id", requireUserAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+
+  const vehicle = db.prepare("SELECT id, user_id FROM vehicles WHERE id = ?").get(id);
+  if (!vehicle) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  if (vehicle.user_id !== req.user.userId) return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+
+  db.prepare("DELETE FROM vehicles WHERE id = ?").run(id);
+  return res.json({ ok: true });
 });
 
 // ======================
