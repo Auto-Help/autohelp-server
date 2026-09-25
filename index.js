@@ -330,6 +330,14 @@ try {
   console.log("⚠️ Migration warning:", e?.message || e);
 }
 
+// Vehicles Pickerl / §57a fields (migration)
+try {
+  addColumnIfMissing("vehicles", "pickerl_month INTEGER");
+  addColumnIfMissing("vehicles", "pickerl_year INTEGER");
+} catch (e) {
+  console.log("⚠️ Migration warning:", e?.message || e);
+}
+
 // Cleanup expired resets periodically
 setInterval(() => {
   try {
@@ -365,6 +373,19 @@ function signToken(payload) {
 }
 function sha256Hex(input) {
   return crypto.createHash("sha256").update(String(input)).digest("hex");
+}
+
+// Company phones must be international (E.164: "+", country code, number) so
+// they can be dialled from any country. Separators people commonly type
+// ("+43 660 123-45", "(+49) 30/1234") are stripped and a leading "00" becomes
+// "+"; anything that still isn't E.164 is rejected — a country is never guessed.
+function normalizePhoneInput(phone) {
+  let p = String(phone || "").trim().replace(/[\s\-./()]/g, "");
+  if (p.startsWith("00")) p = `+${p.slice(2)}`;
+  return p;
+}
+function isE164Phone(phone) {
+  return /^\+[1-9]\d{6,14}$/.test(String(phone || ""));
 }
 
 function requireUserAuth(req, res, next) {
@@ -415,18 +436,27 @@ function getPublicBaseUrl(req) {
   return `${proto}://${host}`.replace(/\/+$/, "");
 }
 
+// Returns a bare "scheme:" (no trailing slashes) when the input carries no
+// host/authority, so the caller's own "///" separator (see appLink below) is
+// always the ONLY source of the 3 slashes in the final canonical
+// "scheme:///path" link -- previously, an input that already included "//"
+// (e.g. "autohelp://", the most intuitive value to configure) combined with
+// the caller's own "///" to produce a malformed 5-slash URL. A host-bearing
+// input (e.g. "autohelp://somehost") still returns "scheme://somehost"
+// unchanged, preserving that case exactly as before.
 function normalizeDeepLinkBase(base) {
   let b = String(base || "").trim();
-  if (!b) return "autohelp://";
+  if (!b) return "autohelp:";
 
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(b)) {
     const idx = b.indexOf("://");
     const scheme = b.slice(0, idx);
     const rest = b.slice(idx + 3).replace(/\/+$/, "");
-    return rest ? `${scheme}://${rest}` : `${scheme}://`;
+    return rest ? `${scheme}://${rest}` : `${scheme}:`;
   }
 
-  return b.replace(/\/+$/, "");
+  const stripped = b.replace(/\/+$/, "");
+  return stripped.endsWith(":") ? stripped : `${stripped}:`;
 }
 
 // Distance (Haversine)
@@ -769,9 +799,42 @@ ${expoGoLink ? `setTimeout(() => { window.location.href = "${expoGoLink}"; }, 90
 // ======================
 // AUTH
 // ======================
+// Strict validation for the optional car_reg_month/car_reg_year fields on
+// registration ONLY. Deliberately NOT reused by/shared with the vehicle
+// POST/PUT endpoints (their existing inline checks have known quirks --
+// truthy-check treats 0 as empty, no Number.isInteger check lets decimals
+// and NaN through -- left untouched as a separate, already-tracked matter).
+// Both fields stay independently optional here (no "both or neither" rule,
+// preserving current product semantics): empty/null/undefined -> null;
+// if provided, must be a finite integer within range, otherwise the whole
+// request is rejected with 400 before any DB write is attempted.
+function parseStrictRegDate(monthRaw, yearRaw) {
+  const isEmpty = (v) => v === null || v === undefined || v === "";
+  const isNumericInput = (v) => typeof v === "number" || typeof v === "string";
+
+  let month = null;
+  if (!isEmpty(monthRaw)) {
+    if (!isNumericInput(monthRaw)) return { error: "INVALID_MONTH" };
+    const n = Number(monthRaw);
+    if (!Number.isInteger(n) || n < 1 || n > 12) return { error: "INVALID_MONTH" };
+    month = n;
+  }
+
+  let year = null;
+  if (!isEmpty(yearRaw)) {
+    if (!isNumericInput(yearRaw)) return { error: "INVALID_YEAR" };
+    const n = Number(yearRaw);
+    if (!Number.isInteger(n) || n < 1900 || n > new Date().getFullYear()) return { error: "INVALID_YEAR" };
+    year = n;
+  }
+
+  return { month, year };
+}
+
 app.post("/api/auth/register-user", rlRegister, (req, res) => {
   const { firstName = "", lastName = "", username = "", email = "", password = "",
-          car_make, car_model, car_reg_month, car_reg_year } = req.body || {};
+          car_make, car_model, car_reg_month, car_reg_year,
+          car_pickerl_month, car_pickerl_year } = req.body || {};
   const e = normalizeEmail(email);
   const u = String(username).trim();
   const fn = String(firstName).trim();
@@ -780,6 +843,12 @@ app.post("/api/auth/register-user", rlRegister, (req, res) => {
   if (!fn || !ln || !u || !e || String(password).length < 6) {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
+
+  const carPickerl = parsePickerlFields(car_pickerl_month, car_pickerl_year);
+  if (carPickerl.error) return res.status(400).json({ ok: false, error: carPickerl.error });
+
+  const carReg = parseStrictRegDate(car_reg_month, car_reg_year);
+  if (carReg.error) return res.status(400).json({ ok: false, error: carReg.error });
 
   const exists =
     db.prepare("SELECT 1 FROM users WHERE email = ?").get(e) ||
@@ -798,11 +867,10 @@ app.post("/api/auth/register-user", rlRegister, (req, res) => {
   // Optional vehicle — create only if at least one field is provided
   const carMake = String(car_make || "").trim();
   const carModel = String(car_model || "").trim();
-  const carMonth = car_reg_month ? Number(car_reg_month) : null;
-  const carYear = car_reg_year ? Number(car_reg_year) : null;
-  if (carMake || carModel || carMonth || carYear) {
-    db.prepare("INSERT INTO vehicles (user_id, make, model, reg_month, reg_year) VALUES (?, ?, ?, ?, ?)")
-      .run(id, carMake || null, carModel || null, carMonth, carYear);
+  if (carMake || carModel || carReg.month || carReg.year || carPickerl.month || carPickerl.year) {
+    db.prepare(
+      "INSERT INTO vehicles (user_id, make, model, reg_month, reg_year, pickerl_month, pickerl_year) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, carMake || null, carModel || null, carReg.month, carReg.year, carPickerl.month, carPickerl.year);
   }
 
   const token = signToken({ type: "user", userId: id });
@@ -870,6 +938,12 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
 
+  // New companies must register with a full international (E.164) phone number.
+  const phoneE164 = normalizePhoneInput(phone);
+  if (!isE164Phone(phoneE164)) {
+    return res.status(400).json({ ok: false, error: "PHONE_INVALID" });
+  }
+
   const exists =
     db.prepare("SELECT 1 FROM users WHERE email = ?").get(e) ||
     db.prepare("SELECT 1 FROM companies WHERE email = ?").get(e);
@@ -888,7 +962,7 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
     id,
     e,
     String(companyName).trim(),
-    String(phone).trim(),
+    phoneE164,
     String(address).trim(),
     passwordHash,
     JSON.stringify(normalizedCategories),
@@ -926,7 +1000,7 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
       id,
       email: e,
       companyName: String(companyName).trim(),
-      phone: String(phone).trim(),
+      phone: phoneE164,
       address: String(address).trim(),
       categories: normalizedCategories,
       lat: Number.isFinite(latNum) ? latNum : null,
@@ -1019,6 +1093,21 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
     }
   }
 
+  // Phone is validated only when it actually changes: an existing company whose
+  // stored number is legacy (non-international) can keep saving other fields,
+  // and its number is never rewritten until it edits the phone itself.
+  let phoneToStore;
+  if (phone !== undefined) {
+    const current = db.prepare("SELECT phone FROM companies WHERE id = ?").get(companyId);
+    if (!current || phone !== String(current.phone || "").trim()) {
+      const phoneE164 = normalizePhoneInput(phone);
+      if (!isE164Phone(phoneE164)) {
+        return res.status(400).json({ ok: false, error: "PHONE_INVALID" });
+      }
+      phoneToStore = phoneE164;
+    }
+  }
+
   const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
   const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
 
@@ -1057,9 +1146,9 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
     sets.push("companyName = ?");
     vals.push(companyName);
   }
-  if (phone !== undefined) {
+  if (phoneToStore !== undefined) {
     sets.push("phone = ?");
-    vals.push(phone);
+    vals.push(phoneToStore);
   }
   if (address !== undefined) {
     sets.push("address = ?");
@@ -1176,6 +1265,7 @@ app.delete("/api/auth/delete-user", requireUserAuth, (req, res) => {
   const deleteAccount = db.transaction(() => {
     db.prepare("DELETE FROM password_resets WHERE accountType = 'user' AND accountId = ?").run(userId);
     db.prepare("DELETE FROM ratings WHERE userId = ?").run(userId);
+    db.prepare("DELETE FROM vehicles WHERE user_id = ?").run(userId);
     db.prepare("DELETE FROM users WHERE id = ?").run(userId);
   });
 
@@ -1378,6 +1468,59 @@ app.get("/api/companies/nearby", (req, res) => {
   return res.json({ ok: true, items: out, category });
 });
 
+// ======================
+// ✅ NEAREST (single true-closest company, no radius cutoff, no open/rating bias)
+// Used exclusively by Home's "Find nearest" button. Registered before
+// /api/companies/:id so Express doesn't match "nearest" as an :id value.
+// ======================
+app.get("/api/companies/nearest", (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  }
+
+  const rows = db.prepare(`SELECT * FROM companies WHERE lat IS NOT NULL AND lng IS NOT NULL`).all();
+
+  let nearest = null;
+  let nearestDist = Infinity;
+
+  for (const c of rows) {
+    const d = haversineKm(lat, lng, Number(c.lat), Number(c.lng));
+    if (d < nearestDist) {
+      nearestDist = d;
+      nearest = c;
+    }
+  }
+
+  if (!nearest) {
+    return res.json({ ok: true, item: null });
+  }
+
+  const rating = getRatingStatsByCompanyId(nearest.id);
+
+  return res.json({
+    ok: true,
+    item: {
+      id: nearest.id,
+      email: nearest.email,
+      companyName: nearest.companyName,
+      phone: nearest.phone,
+      address: nearest.address,
+      categories: parseCategories(nearest.categoriesJson),
+      lat: Number(nearest.lat),
+      lng: Number(nearest.lng),
+      distanceKm: Number(nearestDist.toFixed(2)),
+      openNow: isOpenNow(nearest.workingHoursJson),
+      rating,
+      logoUrl: nearest.logoUrl ?? null,
+      images: parseImages(nearest.imagesJson),
+      servicesText: typeof nearest.servicesText === "string" ? nearest.servicesText : "",
+    },
+  });
+});
+
 // Company details
 app.get("/api/companies/:id", (req, res) => {
   const id = String(req.params.id || "").trim();
@@ -1577,6 +1720,28 @@ app.put("/api/user/password", requireUserAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
+// Pickerl / §57a month+year: both null (no reminder set) or both valid — never just one.
+function parsePickerlFields(monthRaw, yearRaw) {
+  const isEmpty = (v) => v === null || v === undefined || v === "";
+  const month = isEmpty(monthRaw) ? null : Number(monthRaw);
+  const year = isEmpty(yearRaw) ? null : Number(yearRaw);
+
+  if (month !== null && (!Number.isInteger(month) || month < 1 || month > 12)) {
+    return { error: "INVALID_PICKERL_MONTH" };
+  }
+  // Pickerl is a forward-looking due date (unlike reg_year, which looks backward),
+  // so the upper bound intentionally does NOT reuse reg_year's "<= current year" rule.
+  const maxYear = new Date().getFullYear() + 20;
+  if (year !== null && (!Number.isInteger(year) || year < 1900 || year > maxYear)) {
+    return { error: "INVALID_PICKERL_YEAR" };
+  }
+  if ((month === null) !== (year === null)) {
+    return { error: "INVALID_INPUT" };
+  }
+
+  return { month, year };
+}
+
 // GET /api/user/vehicles — всички автомобили на потребителя
 app.get("/api/user/vehicles", requireUserAuth, (req, res) => {
   const vehicles = db.prepare("SELECT * FROM vehicles WHERE user_id = ? ORDER BY created_at ASC").all(req.user.userId);
@@ -1594,9 +1759,12 @@ app.post("/api/user/vehicles", requireUserAuth, (req, res) => {
   if (month !== null && (month < 1 || month > 12)) return res.status(400).json({ ok: false, error: "INVALID_MONTH" });
   if (year !== null && (year < 1900 || year > new Date().getFullYear())) return res.status(400).json({ ok: false, error: "INVALID_YEAR" });
 
+  const pickerl = parsePickerlFields(req.body?.pickerl_month, req.body?.pickerl_year);
+  if (pickerl.error) return res.status(400).json({ ok: false, error: pickerl.error });
+
   const result = db.prepare(
-    "INSERT INTO vehicles (user_id, make, model, reg_month, reg_year) VALUES (?, ?, ?, ?, ?)"
-  ).run(req.user.userId, makeStr || null, modelStr || null, month, year);
+    "INSERT INTO vehicles (user_id, make, model, reg_month, reg_year, pickerl_month, pickerl_year) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run(req.user.userId, makeStr || null, modelStr || null, month, year, pickerl.month, pickerl.year);
 
   const vehicle = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(result.lastInsertRowid);
   return res.status(201).json({ ok: true, vehicle });
@@ -1620,9 +1788,21 @@ app.put("/api/user/vehicles/:id", requireUserAuth, (req, res) => {
   if (month !== null && (month < 1 || month > 12)) return res.status(400).json({ ok: false, error: "INVALID_MONTH" });
   if (year !== null && (year < 1900 || year > new Date().getFullYear())) return res.status(400).json({ ok: false, error: "INVALID_YEAR" });
 
+  // App versions released before Pickerl support send PUT without these keys
+  // at all; keep the stored values then instead of wiping a confirmed date.
+  // An explicit null (key present) still clears it.
+  const body = req.body || {};
+  const sendsPickerl = Object.prototype.hasOwnProperty.call(body, "pickerl_month") ||
+    Object.prototype.hasOwnProperty.call(body, "pickerl_year");
+  const stored = db.prepare("SELECT pickerl_month, pickerl_year FROM vehicles WHERE id = ?").get(id);
+  const pickerl = sendsPickerl
+    ? parsePickerlFields(body.pickerl_month, body.pickerl_year)
+    : { month: stored?.pickerl_month ?? null, year: stored?.pickerl_year ?? null };
+  if (pickerl.error) return res.status(400).json({ ok: false, error: pickerl.error });
+
   db.prepare(
-    "UPDATE vehicles SET make = ?, model = ?, reg_month = ?, reg_year = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-  ).run(makeStr || null, modelStr || null, month, year, id);
+    "UPDATE vehicles SET make = ?, model = ?, reg_month = ?, reg_year = ?, pickerl_month = ?, pickerl_year = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+  ).run(makeStr || null, modelStr || null, month, year, pickerl.month, pickerl.year, id);
 
   const updated = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(id);
   return res.json({ ok: true, vehicle: updated });
