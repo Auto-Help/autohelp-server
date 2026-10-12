@@ -9,13 +9,28 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const Database = require("better-sqlite3");
 const morgan = require("morgan");
+const helmet = require("helmet");
 const fs = require("fs");
 const path = require("path");
 
 // ✅ UPLOAD (LOCAL /data/uploads on Render Persistent Disk)
 const multer = require("multer");
+const { imageSize } = require("image-size");
 
 const app = express();
+
+// Security headers (helmet). Two of its defaults would break the apps and are
+// changed on purpose:
+//  - no global Content-Security-Policy: the API answers JSON, and the only
+//    HTML/files it serves set their own (/uploads, /reset-password);
+//  - Cross-Origin-Resource-Policy "cross-origin": the Android/iOS WebViews
+//    (https://localhost, capacitor://localhost) load company images from here.
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
 
 // Body parsers
 app.use(express.json());
@@ -73,14 +88,72 @@ const RESET_TOKEN_TTL_MS = Number(process.env.RESET_TOKEN_TTL_MS || 30 * 60 * 10
 // Nearby defaults
 const DEFAULT_RADIUS_KM = Number(process.env.DEFAULT_RADIUS_KM || 50);
 
+// Public base URL of THIS server, used in password-reset e-mail links and in
+// uploaded image URLs. It must never be derived from request headers in
+// production (Host / X-Forwarded-Host are client-controlled): otherwise a
+// forged header puts an attacker's domain into a real reset e-mail.
+// Order: PUBLIC_BASE_URL -> RENDER_EXTERNAL_URL (set by Render itself) ->
+// the known production URL. A missing/invalid value only logs a warning; it
+// never stops the server from starting.
+const PROD_FALLBACK_BASE_URL = "https://autohelp-server.onrender.com";
+
+function parseBaseUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    if (u.username || u.password || u.search || u.hash) return null;
+    return `${u.origin}${u.pathname}`.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+const PUBLIC_BASE_URL_ENV = parseBaseUrl(process.env.PUBLIC_BASE_URL);
+const RENDER_EXTERNAL_URL_ENV = parseBaseUrl(process.env.RENDER_EXTERNAL_URL);
+const FIXED_PUBLIC_BASE_URL =
+  PUBLIC_BASE_URL_ENV || RENDER_EXTERNAL_URL_ENV || (IS_PROD ? PROD_FALLBACK_BASE_URL : null);
+
+if (String(process.env.PUBLIC_BASE_URL || "").trim() && !PUBLIC_BASE_URL_ENV) {
+  console.warn("⚠️ PUBLIC_BASE_URL is not a valid http(s) URL and is ignored.");
+}
+if (IS_PROD && !PUBLIC_BASE_URL_ENV) {
+  console.warn(`⚠️ PUBLIC_BASE_URL is not set; using ${FIXED_PUBLIC_BASE_URL} for links.`);
+}
+
+// Reverse proxy. TRUST_PROXY_HOPS = number of proxies in front of the app
+// (verify on the real deployment before setting it). When set, req.ip is
+// taken from X-Forwarded-For counted from the right, so a client-supplied
+// value can't be used to dodge rate limits. When NOT set, the previous
+// behaviour (left-most X-Forwarded-For) is kept so real users are never
+// lumped together behind one proxy address; the account-based limits below
+// protect login and password-reset regardless of the IP.
+const TRUST_PROXY_HOPS_RAW = String(process.env.TRUST_PROXY_HOPS || "").trim();
+const TRUST_PROXY_HOPS = /^\d+$/.test(TRUST_PROXY_HOPS_RAW) ? Number(TRUST_PROXY_HOPS_RAW) : null;
+if (TRUST_PROXY_HOPS !== null) {
+  app.set("trust proxy", TRUST_PROXY_HOPS);
+} else if (IS_PROD) {
+  console.warn("⚠️ TRUST_PROXY_HOPS is not set; IP rate limits use the left-most X-Forwarded-For.");
+}
+
 // ======================
 // LOGS
 // ======================
-app.use(morgan(":method :url :status - :response-time ms"));
+// Password-reset tokens must never end up in the logs.
+morgan.token("safe-url", (req) => String(req.originalUrl || req.url).replace(/([?&]token=)[^&]*/gi, "$1***"));
+app.use(morgan(":method :safe-url :status - :response-time ms"));
 
 // ======================
 // SIMPLE RATE LIMIT (in-memory)
 // ======================
+function clientIp(req) {
+  if (TRUST_PROXY_HOPS !== null) return String(req.ip || "unknown");
+  return String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown")
+    .split(",")[0]
+    .trim();
+}
+
 function createRateLimiter({ windowMs, max, keyPrefix }) {
   const hits = new Map();
   const cleanupEveryMs = Math.max(30_000, Math.floor(windowMs / 2));
@@ -94,9 +167,7 @@ function createRateLimiter({ windowMs, max, keyPrefix }) {
 
   return function rateLimit(req, res, next) {
     const now = Date.now();
-    const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown")
-      .split(",")[0]
-      .trim();
+    const ip = clientIp(req);
     const key = `${keyPrefix}:${ip}`;
 
     const v = hits.get(key);
@@ -117,6 +188,122 @@ const rlLogin    = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20, keyPre
 const rlForgot   = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5,  keyPrefix: "forgot" });
 const rlReset    = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "reset" });
 const rlRegister = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "register" });
+
+// Reset e-mails per address, independent of the client IP (which may be forged).
+function createKeyLimiter({ windowMs, max }) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits.entries()) {
+      if (!v || now >= v.resetAt) hits.delete(k);
+    }
+  }, Math.max(30_000, Math.floor(windowMs / 2))).unref?.();
+
+  return {
+    isBlocked(key) {
+      const v = hits.get(key);
+      return !!v && Date.now() < v.resetAt && v.count >= max;
+    },
+    hit(key) {
+      const now = Date.now();
+      const v = hits.get(key);
+      if (!v || now >= v.resetAt) hits.set(key, { count: 1, resetAt: now + windowMs });
+      else v.count += 1;
+    },
+    reset(key) {
+      hits.delete(key);
+    },
+  };
+}
+
+const resetMailsPerEmail = createKeyLimiter({ windowMs: 60 * 60 * 1000, max: 3 });
+
+// Progressive throttling of failed password checks (instead of a hard
+// lock-out that anyone knowing an e-mail could trigger). The first 5 failures
+// are free; after that the next attempt is only accepted after 1, 2, 4, 8, 16,
+// 32, 64, then at most 120 seconds — about 40 guesses per hour, the same as
+// the former 10-per-15-minutes lock. Earlier attempts get 429 RATE_LIMIT with
+// a Retry-After header and the password is not checked. A success, or one
+// hour without failures, forgets the failures.
+//
+// Request handlers check, verify (bcrypt compareSync) and record in one
+// synchronous run, so parallel requests can't slip in between.
+const THROTTLE_FREE_FAILURES = 5;
+const THROTTLE_BASE_DELAY_MS = 1000;
+const THROTTLE_MAX_DELAY_MS = 120 * 1000;
+const THROTTLE_FORGET_AFTER_MS = 60 * 60 * 1000;
+
+function createFailureThrottle() {
+  const state = new Map(); // key -> { failures, lastFailureAt, nextAllowedAt }
+  const live = (key, now) => {
+    const s = state.get(key);
+    if (s && now - s.lastFailureAt >= THROTTLE_FORGET_AFTER_MS) {
+      state.delete(key);
+      return null;
+    }
+    return s || null;
+  };
+  setInterval(() => {
+    const now = Date.now();
+    for (const key of state.keys()) live(key, now);
+  }, 5 * 60 * 1000).unref?.();
+
+  return {
+    retryAfterMs(key) {
+      const now = Date.now();
+      const s = live(key, now);
+      if (!s || s.failures < THROTTLE_FREE_FAILURES) return 0;
+      return Math.max(0, s.nextAllowedAt - now);
+    },
+    fail(key) {
+      const now = Date.now();
+      const s = live(key, now) || { failures: 0 };
+      s.failures += 1;
+      s.lastFailureAt = now;
+      const over = s.failures - THROTTLE_FREE_FAILURES;
+      s.nextAllowedAt = over >= 0 ? now + Math.min(THROTTLE_BASE_DELAY_MS * 2 ** over, THROTTLE_MAX_DELAY_MS) : now;
+      state.set(key, s);
+    },
+    clear(key) {
+      state.delete(key);
+    },
+  };
+}
+
+const loginThrottle = createFailureThrottle();
+const passwordChangeThrottle = createFailureThrottle();
+
+function sendRateLimited(res, retryAfterMs) {
+  res.setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+  return res.status(429).json({ ok: false, error: "RATE_LIMIT" });
+}
+
+// Unknown accounts still cost one bcrypt check, so "no such account" and
+// "wrong password" take about the same time.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
+
+// Password check shared by user and company login. Returns true on success;
+// otherwise it has already answered 401 INVALID_LOGIN or 429 RATE_LIMIT.
+// The answer is the same whether or not the account exists. One counter per
+// account: the client IP (forgeable until TRUST_PROXY_HOPS is verified) gives
+// no privilege.
+function checkLoginPassword(res, accountKey, row, password) {
+  const wait = loginThrottle.retryAfterMs(accountKey);
+  if (wait > 0) {
+    sendRateLimited(res, wait);
+    return false;
+  }
+
+  const matches = bcrypt.compareSync(password, row ? row.passwordHash : DUMMY_PASSWORD_HASH);
+  if (!row || !matches) {
+    loginThrottle.fail(accountKey);
+    res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
+    return false;
+  }
+
+  loginThrottle.clear(accountKey);
+  return true;
+}
 
 // ======================
 // CORS
@@ -147,20 +334,27 @@ function isAllowedOrigin(origin) {
   return false;
 }
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (isAllowedOrigin(origin)) return cb(null, true);
-      return cb(new Error("CORS_NOT_ALLOWED"), false);
-    },
-    credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization"],
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  })
-);
+function httpError(status, code) {
+  const err = new Error(code);
+  err.status = status;
+  err.code = code;
+  return err;
+}
 
-// Preflight
-app.options("*", cors());
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    return cb(httpError(403, "CORS_NOT_ALLOWED"), false);
+  },
+  credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+};
+
+app.use(cors(corsOptions));
+
+// Preflight (same origin rules as the actual requests)
+app.options("*", cors(corsOptions));
 
 // ======================
 // UPLOADS: ensure dir + serve static
@@ -174,8 +368,44 @@ function ensureDir(dir) {
 }
 ensureDir(UPLOAD_DIR);
 
+// Image types served inline. Anything else already on the disk (e.g. a file
+// stored by an older version under a client-chosen extension) is only ever
+// offered as a download, so it can't run as HTML/SVG on this origin.
+const UPLOAD_CONTENT_TYPES = new Map([
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".jfif", "image/jpeg"],
+  [".png", "image/png"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+  [".heic", "image/heic"],
+  [".heif", "image/heif"],
+]);
+
 // ✅ serve: https://your-server.onrender.com/uploads/<file>
-app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "7d", etag: true }));
+app.use(
+  "/uploads",
+  (req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+    next();
+  },
+  express.static(UPLOAD_DIR, {
+    maxAge: "7d",
+    etag: true,
+    index: false,
+    dotfiles: "ignore",
+    setHeaders: (res, filePath) => {
+      const type = UPLOAD_CONTENT_TYPES.get(path.extname(filePath).toLowerCase());
+      if (type) {
+        res.setHeader("Content-Type", type);
+      } else {
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.setHeader("Content-Disposition", "attachment");
+      }
+    },
+  })
+);
 
 function hasUploads() {
   try {
@@ -186,52 +416,90 @@ function hasUploads() {
   }
 }
 
-function extFromMime(mime) {
-  const m = String(mime || "").toLowerCase();
-  if (m === "image/jpeg") return ".jpg";
-  if (m === "image/png") return ".png";
-  if (m === "image/webp") return ".webp";
-  if (m === "image/gif") return ".gif";
-  if (m === "image/heic" || m === "image/heif") return ".heic";
-  return "";
+// The stored type is decided by the file's own bytes (signature), never by
+// the client's MIME type or file name. Same formats as before: JPEG, PNG,
+// WebP, GIF and HEIC/HEIF (iPhone photos). Returns the extension or null.
+const HEIC_BRANDS = new Set(["heic", "heix", "hevc", "hevx", "heim", "heis"]);
+const HEIF_BRANDS = new Set(["mif1", "msf1"]);
+
+function detectImageExt(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
+
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return ".jpg";
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return ".png";
+  const head6 = buf.toString("latin1", 0, 6);
+  if (head6 === "GIF87a" || head6 === "GIF89a") return ".gif";
+  if (buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "WEBP") return ".webp";
+
+  // ISO-BMFF: [size][ftyp][major brand][minor version][compatible brands...]
+  if (buf.toString("latin1", 4, 8) === "ftyp") {
+    const boxSize = Math.min(buf.readUInt32BE(0), buf.length);
+    const brands = [buf.toString("latin1", 8, 12)];
+    for (let i = 16; i + 4 <= boxSize; i += 4) brands.push(buf.toString("latin1", i, i + 4));
+    if (brands.includes("avif") || brands.includes("avis")) return null; // not supported before either
+    if (brands.some((b) => HEIC_BRANDS.has(b))) return ".heic";
+    if (brands.some((b) => HEIF_BRANDS.has(b))) return ".heif";
+  }
+  return null;
 }
 
-function safeFileName(companyId, kind, originalName, mime) {
+// Pixel limits, checked from the image's own header before anything is
+// written. 12 000 px per side and 60 MP cover the 48–50 MP modes of current
+// phones (8064×6048, 8160×6120) but stop "pixel bombs" — tiny files that
+// claim huge dimensions and exhaust a phone's memory when displayed.
+const MAX_IMAGE_SIDE = 12000;
+const MAX_IMAGE_PIXELS = 60 * 1000 * 1000;
+
+// image-size reports HEIC/HEIF by the file's major brand (heic, mif1, ...).
+const HEIF_MAJOR_BRANDS = ["heic", "heix", "hevc", "hevx", "mif1", "msf1"];
+const IMAGE_SIZE_TYPES = {
+  ".jpg": ["jpg"],
+  ".png": ["png"],
+  ".gif": ["gif"],
+  ".webp": ["webp"],
+  ".heic": HEIF_MAJOR_BRANDS,
+  ".heif": HEIF_MAJOR_BRANDS,
+};
+
+// Returns null when the image is fine, otherwise the API error code. A file
+// whose dimensions can't be read reliably (damaged, truncated, or a HEIC/HEIF
+// without size information) is rejected like any other non-image.
+function checkImageDimensions(buf, ext) {
+  let info;
+  try {
+    info = imageSize(buf);
+  } catch {
+    return "ONLY_IMAGES_ALLOWED";
+  }
+  if (!IMAGE_SIZE_TYPES[ext]?.includes(info?.type)) return "ONLY_IMAGES_ALLOWED";
+
+  // HEIC/HEIF hold several sizes (thumbnail, tiles, full image): the largest counts.
+  const sizes = Array.isArray(info.images) && info.images.length ? info.images : [info];
+  let maxW = 0;
+  let maxH = 0;
+  for (const s of sizes) {
+    const w = Number(s?.width);
+    const h = Number(s?.height);
+    if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1) return "ONLY_IMAGES_ALLOWED";
+    maxW = Math.max(maxW, w);
+    maxH = Math.max(maxH, h);
+    if (w * h > MAX_IMAGE_PIXELS) return "IMAGE_TOO_LARGE";
+  }
+  if (maxW > MAX_IMAGE_SIDE || maxH > MAX_IMAGE_SIDE) return "IMAGE_TOO_LARGE";
+  return null;
+}
+
+function safeFileName(companyId, kind, ext) {
   const rand = crypto.randomBytes(12).toString("hex");
-  const ext =
-    path.extname(String(originalName || "")).slice(0, 10) ||
-    extFromMime(mime) ||
-    ".bin";
-  return `${companyId}_${kind}_${Date.now()}_${rand}${ext}`;
+  const owner = String(companyId || "unknown").replace(/[^A-Za-z0-9_-]/g, "");
+  return `${owner}_${kind}_${Date.now()}_${rand}${ext}`;
 }
 
-// Multer disk storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const companyId = req.company?.companyId || "unknown";
-    const kind = file.fieldname === "logo" ? "logo" : "img";
-    cb(null, safeFileName(companyId, kind, file.originalname, file.mimetype));
-  },
-});
-
+// Files are held in memory, checked, and only then written to UPLOAD_DIR —
+// a rejected file never touches the disk. 4 files x 8 MB at most per request.
 const upload = multer({
-  storage,
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB per file
-  fileFilter: (req, file, cb) => {
-    const m = String(file.mimetype || "").toLowerCase();
-    if (
-      m === "image/jpeg" ||
-      m === "image/png" ||
-      m === "image/webp" ||
-      m === "image/gif" ||
-      m === "image/heic" ||
-      m === "image/heif"
-    ) {
-      return cb(null, true);
-    }
-    return cb(new Error("ONLY_IMAGES_ALLOWED"));
-  },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024, files: 4, fields: 20, parts: 30 },
 });
 
 // ======================
@@ -357,6 +625,27 @@ function createId(prefix) {
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
+
+// Plain mailbox addresses only, as people type them into a form: one "@", no
+// spaces, quotes, commas, angle brackets or comments — nothing the mail
+// library could read as a display name or a list of recipients (see the open
+// nodemailer advisories). At most 254 characters; the local part at most 64.
+// Domain labels may use letters of any script (e.g. müller.at).
+const EMAIL_LOCAL_RE = /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/i;
+const EMAIL_LABEL_RE = /^[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?$/u;
+const EMAIL_TLD_RE = /^(?:\p{L}{2,63}|xn--[a-z0-9-]{1,59})$/u;
+
+function isValidEmail(email) {
+  const s = String(email || "");
+  if (s.length > 254) return false;
+  const at = s.indexOf("@");
+  if (at < 1 || at !== s.lastIndexOf("@")) return false;
+  const local = s.slice(0, at);
+  const labels = s.slice(at + 1).split(".");
+  if (local.length > 64 || !EMAIL_LOCAL_RE.test(local)) return false;
+  if (labels.length < 2 || !labels.every((l) => EMAIL_LABEL_RE.test(l))) return false;
+  return EMAIL_TLD_RE.test(labels[labels.length - 1]);
+}
 function hasSmtp() {
   return !!(SMTP_HOST && SMTP_USER && SMTP_PASS && SMTP_FROM);
 }
@@ -398,6 +687,11 @@ function requireUserAuth(req, res, next) {
     if (!decoded || decoded.type !== "user" || !decoded.userId) {
       return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
     }
+    // A token outlives a deleted account (JWTs can't be recalled): the account
+    // must still exist. Same error as any other invalid token.
+    if (!db.prepare("SELECT 1 FROM users WHERE id = ?").get(String(decoded.userId))) {
+      return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
+    }
     req.user = { userId: decoded.userId };
     return next();
   } catch {
@@ -415,6 +709,9 @@ function requireCompanyAuth(req, res, next) {
     if (!decoded || decoded.type !== "company" || !decoded.companyId) {
       return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
     }
+    if (!db.prepare("SELECT 1 FROM companies WHERE id = ?").get(String(decoded.companyId))) {
+      return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
+    }
     req.company = { companyId: decoded.companyId };
     return next();
   } catch {
@@ -422,18 +719,14 @@ function requireCompanyAuth(req, res, next) {
   }
 }
 
-// Render / proxy safe base URL
+// Base URL for links and image URLs. Production: always the configured value
+// (see FIXED_PUBLIC_BASE_URL) — never Host / X-Forwarded-Host. Local
+// development without any configured URL falls back to the Host header so a
+// phone on the LAN still gets working image URLs; X-Forwarded-* is ignored.
 function getPublicBaseUrl(req) {
-  const forced = String(process.env.PUBLIC_BASE_URL || "").trim();
-  if (forced) return forced.replace(/\/+$/, "");
-
-  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
-    .split(",")[0]
-    .trim();
-  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "")
-    .split(",")[0]
-    .trim();
-  return `${proto}://${host}`.replace(/\/+$/, "");
+  if (FIXED_PUBLIC_BASE_URL) return FIXED_PUBLIC_BASE_URL;
+  const host = String(req.get("host") || `localhost:${PORT}`).trim();
+  return `http://${host}`.replace(/\/+$/, "");
 }
 
 // Returns a bare "scheme:" (no trailing slashes) when the input carries no
@@ -459,6 +752,19 @@ function normalizeDeepLinkBase(base) {
   return stripped.endsWith(":") ? stripped : `${stripped}:`;
 }
 
+// A usable coordinate pair, or null. Both values must be present and in range
+// (a decimal comma is accepted); (0, 0) means "no position" — no workshop is there.
+function parseCoordPair(lat, lng) {
+  const toNum = (v) =>
+    v === null || v === undefined || v === "" ? NaN : Number(typeof v === "string" ? v.trim().replace(",", ".") : v);
+  const la = toNum(lat);
+  const ln = toNum(lng);
+  if (!Number.isFinite(la) || !Number.isFinite(ln)) return null;
+  if (la < -90 || la > 90 || ln < -180 || ln > 180) return null;
+  if (la === 0 && ln === 0) return null;
+  return { lat: la, lng: ln };
+}
+
 // Distance (Haversine)
 function haversineKm(lat1, lon1, lat2, lon2) {
   const toRad = (x) => (x * Math.PI) / 180;
@@ -472,48 +778,121 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Working hours helper
-function isOpenNow(workingHoursJson) {
+// ======================
+// WORKING HOURS (Europe/Vienna)
+// ======================
+// Stored as {"mon":[["09:00","18:00"]], ..., "sun":[]} (the dashboard format);
+// an older [{day, from, to}] list is still read. Times are local Vienna
+// time, whatever the server's own time zone (Render runs on UTC), with
+// summer/winter time handled by Intl. A slot is open from its start up to,
+// not including, its end. Special cases:
+//   "22:00"-"06:00"  overnight: open until 06:00 the next morning
+//   "00:00"-"24:00"  the whole day (7 such days = 24/7); "x"-"x" too
+// isOpenNow() returns true / false, or null when the hours are unknown.
+const BUSINESS_TIME_ZONE = "Europe/Vienna";
+const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const viennaClockFormat = new Intl.DateTimeFormat("en-US", {
+  timeZone: BUSINESS_TIME_ZONE,
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function viennaClock(date) {
+  const parts = Object.fromEntries(viennaClockFormat.formatToParts(date).map((p) => [p.type, p.value]));
+  return { dayIdx: WEEKDAY_INDEX[parts.weekday], minutes: Number(parts.hour) * 60 + Number(parts.minute) };
+}
+
+// "HH:MM" (optionally ":SS") -> minutes since midnight; "24:00" -> 1440; else null.
+function parseClockTime(value) {
+  const m = String(value ?? "").trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (min > 59 || h > 24 || (h === 24 && min !== 0)) return null;
+  return h * 60 + min;
+}
+
+// -> { mon: [[from, to], ...], ... } in minutes (a missing day stays undefined), or null.
+function parseWorkingHours(workingHoursJson) {
   if (!workingHoursJson) return null;
-  let data = null;
+  let data;
   try {
-    data = JSON.parse(workingHoursJson);
+    data = typeof workingHoursJson === "string" ? JSON.parse(workingHoursJson) : workingHoursJson;
   } catch {
     return null;
   }
-
-  const now = new Date();
-  const dayIdx = now.getDay();
-  const dayKey = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dayIdx];
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const cur = `${hh}:${mm}`;
-
+  const days = {};
+  const add = (day, from, to) => {
+    const f = parseClockTime(from);
+    const t = parseClockTime(to);
+    if (f === null || t === null) return;
+    days[day].push([f, t]);
+  };
   if (data && typeof data === "object" && !Array.isArray(data)) {
-    const slots = data[dayKey];
-    if (!Array.isArray(slots)) return null;
-    for (const s of slots) {
-      if (Array.isArray(s) && s.length >= 2) {
-        const from = String(s[0]);
-        const to = String(s[1]);
-        if (from <= cur && cur <= to) return true;
-      }
+    for (const day of DAY_KEYS) {
+      if (!Array.isArray(data[day])) continue;
+      days[day] = [];
+      for (const s of data[day]) if (Array.isArray(s) && s.length >= 2) add(day, s[0], s[1]);
     }
-    return false;
+    return days;
   }
-
   if (Array.isArray(data)) {
-    const slots = data.filter((x) => x && String(x.day).toLowerCase() === dayKey);
-    if (!slots.length) return null;
-    for (const s of slots) {
-      const from = String(s.from || "");
-      const to = String(s.to || "");
-      if (from && to && from <= cur && cur <= to) return true;
+    for (const s of data) {
+      const day = String(s?.day || "").toLowerCase();
+      if (!DAY_KEYS.includes(day)) continue;
+      days[day] = days[day] || [];
+      add(day, s.from, s.to);
     }
-    return false;
+    return days;
+  }
+  return null;
+}
+
+function isOpenNow(workingHoursJson, now = new Date()) {
+  const days = parseWorkingHours(workingHoursJson);
+  if (!days) return null;
+  const { dayIdx, minutes } = viennaClock(now);
+
+  // An overnight slot that started yesterday may still be running.
+  for (const [from, to] of days[DAY_KEYS[(dayIdx + 6) % 7]] || []) {
+    if (from > to && minutes < to) return true;
   }
 
-  return null;
+  const today = days[DAY_KEYS[dayIdx]];
+  if (!today) return null;
+  for (const [from, to] of today) {
+    if (from === to) return true; // whole day
+    if (from < to ? minutes >= from && minutes < to : minutes >= from) return true;
+  }
+  return false;
+}
+
+// Checks hours sent by a client. Returns the string to store, null to clear,
+// or undefined when the value isn't valid working hours.
+function normalizeWorkingHoursInput(raw) {
+  if (raw === null || raw === "") return null;
+  let data = raw;
+  if (typeof raw === "string") {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  for (const [day, slots] of Object.entries(data)) {
+    if (!DAY_KEYS.includes(day) || !Array.isArray(slots) || slots.length > 6) return undefined;
+    for (const s of slots) {
+      if (!Array.isArray(s) || s.length !== 2) return undefined;
+      const from = parseClockTime(s[0]);
+      const to = parseClockTime(s[1]);
+      if (from === null || to === null || from === 24 * 60) return undefined;
+    }
+  }
+  return typeof raw === "string" ? raw : JSON.stringify(data);
 }
 
 // ======================
@@ -635,10 +1014,11 @@ function msg(lang, key) {
         `Здравей,\n\nнатисни този линк, за да смениш паролата си:\n${link}\n\nЛинкът е валиден 30 минути.\n\nАко не си ти, просто игнорирай този имейл.`,
     },
   };
-  const v = dict[key];
+  const v = Object.hasOwn(dict, key) ? dict[key] : null;
   if (!v) return "";
   if (typeof v === "function") return v;
-  return v[L] || v.en;
+  // own keys only: a "lang" like "constructor" must not pick Object built-ins
+  return Object.hasOwn(v, L) ? v[L] : v.en;
 }
 
 // ======================
@@ -656,8 +1036,8 @@ app.get("/health", (req, res) => {
     env: NODE_ENV,
     hasSmtp: hasSmtp(),
     hasUploads: hasUploads(),
-    uploadDir: UPLOAD_DIR,
-    dbFile: DB_FILE,
+    // server paths only for local troubleshooting, not on the public server
+    ...(IS_PROD ? {} : { uploadDir: UPLOAD_DIR, dbFile: DB_FILE }),
     dbFileExists: exists,
     dbFileSize: size,
     time: new Date().toISOString(),
@@ -680,13 +1060,24 @@ app.head("/api/health", (req, res) => res.sendStatus(200));
 // Auth: company
 // Returns public URLs
 // ======================
+const uploadFields = upload.fields([
+  { name: "logo", maxCount: 1 },
+  { name: "images", maxCount: 3 },
+]);
+
+// A broken multipart body (busboy error) is the client's fault: 400, not 500.
+function parseUpload(req, res, next) {
+  uploadFields(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) return next(err);
+    return next(httpError(400, "INVALID_UPLOAD"));
+  });
+}
+
 app.post(
   "/api/company/upload-media",
   requireCompanyAuth,
-  upload.fields([
-    { name: "logo", maxCount: 1 },
-    { name: "images", maxCount: 3 },
-  ]),
+  parseUpload,
   (req, res) => {
     try {
       if (!hasUploads()) {
@@ -697,17 +1088,42 @@ app.post(
       const base = getPublicBaseUrl(req);
 
       const logoFile = req.files?.logo?.[0] || null;
-      const imageFiles = Array.isArray(req.files?.images) ? req.files.images : [];
+      const imageFiles = Array.isArray(req.files?.images) ? req.files.images.slice(0, 3) : [];
+
+      // Check every file first; one bad file rejects the whole request.
+      const planned = [];
+      for (const [kind, f] of [
+        ...(logoFile ? [["logo", logoFile]] : []),
+        ...imageFiles.map((f) => ["img", f]),
+      ]) {
+        const ext = detectImageExt(f.buffer);
+        if (!ext) return res.status(400).json({ ok: false, error: "ONLY_IMAGES_ALLOWED" });
+        const problem = checkImageDimensions(f.buffer, ext);
+        if (problem) return res.status(400).json({ ok: false, error: problem });
+        planned.push({ kind, buffer: f.buffer, filename: safeFileName(companyId, kind, ext) });
+      }
+
+      const written = [];
+      try {
+        for (const p of planned) {
+          fs.writeFileSync(path.join(UPLOAD_DIR, p.filename), p.buffer, { flag: "wx" });
+          written.push(p.filename);
+        }
+      } catch (e) {
+        for (const name of written) {
+          try {
+            fs.unlinkSync(path.join(UPLOAD_DIR, name));
+          } catch {}
+        }
+        throw e;
+      }
 
       let logoUrl = null;
       const images = [];
-
-      if (logoFile?.filename) {
-        logoUrl = `${base}/uploads/${encodeURIComponent(logoFile.filename)}`;
-      }
-
-      for (const f of imageFiles.slice(0, 3)) {
-        if (f?.filename) images.push(`${base}/uploads/${encodeURIComponent(f.filename)}`);
+      for (const p of planned) {
+        const url = `${base}/uploads/${encodeURIComponent(p.filename)}`;
+        if (p.kind === "logo") logoUrl = url;
+        else images.push(url);
       }
 
       // merge нови снимки със съществуващите (max 3, без дублиране)
@@ -738,10 +1154,6 @@ app.post(
       return res.json({ ok: true, logoUrl, images: mergedImages });
     } catch (e) {
       console.error("upload-media error:", e?.message || e);
-      const msg = String(e?.message || "");
-      if (msg.includes("ONLY_IMAGES_ALLOWED")) {
-        return res.status(400).json({ ok: false, error: "ONLY_IMAGES_ALLOWED" });
-      }
       return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
     }
   }
@@ -759,6 +1171,15 @@ app.get("/reset-password", (req, res) => {
     ? `${EXP_DEEP_LINK_BASE}/--/reset-password?token=${encodeURIComponent(token)}`
     : "";
 
+  // Own strict CSP: only this page's inline script (by nonce) may run, inline
+  // styles are allowed, nothing is loaded from anywhere. Never cached, since
+  // the URL carries the reset token.
+  const nonce = crypto.randomBytes(16).toString("base64");
+  res.setHeader(
+    "Content-Security-Policy",
+    `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+  );
+  res.setHeader("Cache-Control", "no-store");
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
 <html>
@@ -788,7 +1209,7 @@ code{background:#0b1220;padding:2px 6px;border-radius:8px}
   ${expoGoLink ? `<div class="row muted">Expo Go link: <code>${expoGoLink}</code></div>` : ""}
 </div>
 
-<script>
+<script nonce="${nonce}">
 setTimeout(() => { window.location.href = "${appLink}"; }, 200);
 ${expoGoLink ? `setTimeout(() => { window.location.href = "${expoGoLink}"; }, 900);` : ""}
 </script>
@@ -843,6 +1264,7 @@ app.post("/api/auth/register-user", rlRegister, (req, res) => {
   if (!fn || !ln || !u || !e || String(password).length < 6) {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
+  if (!isValidEmail(e)) return res.status(400).json({ ok: false, error: "INVALID_EMAIL" });
 
   const carPickerl = parsePickerlFields(car_pickerl_month, car_pickerl_year);
   if (carPickerl.error) return res.status(400).json({ ok: false, error: carPickerl.error });
@@ -889,10 +1311,9 @@ app.post("/api/auth/login-user", rlLogin, (req, res) => {
     ? db.prepare("SELECT * FROM users WHERE email = ?").get(email)
     : db.prepare("SELECT * FROM users WHERE username = ?").get(username);
 
-  if (!row) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
-
-  const ok = bcrypt.compareSync(password, row.passwordHash);
-  if (!ok) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
+  // One counter per real account (e-mail and username share it).
+  const accountKey = row ? `user:id:${row.id}` : email ? `user:email:${email}` : `user:name:${username.toLowerCase()}`;
+  if (!checkLoginPassword(res, accountKey, row, password)) return;
 
   const token = signToken({ type: "user", userId: row.id });
 
@@ -937,6 +1358,7 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
   ) {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
+  if (!isValidEmail(e)) return res.status(400).json({ ok: false, error: "INVALID_EMAIL" });
 
   // New companies must register with a full international (E.164) phone number.
   const phoneE164 = normalizePhoneInput(phone);
@@ -950,12 +1372,23 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
 
   if (exists) return res.status(409).json({ ok: false, error: "EMAIL_EXISTS" });
 
+  // Only hours the company really entered. The registration form of the
+  // installed apps sends no hours of its own, just the form's 09:00–18:00
+  // defaults as `openingHours`; those are deliberately ignored, so a new
+  // company's hours stay unknown until it sets them in the dashboard.
+  const hoursToStore = normalizeWorkingHoursInput(workingHoursJson);
+  if (hoursToStore === undefined) return res.status(400).json({ ok: false, error: "INVALID_WORKING_HOURS" });
+
+  const servicesTextRaw = req.body?.servicesText;
+  const servicesText = typeof servicesTextRaw === "string" ? servicesTextRaw.trim() : "";
+
   const id = createId("c");
   const passwordHash = bcrypt.hashSync(String(password), 10);
   const createdAt = nowMs();
 
-  const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
-  const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
+  const coords = parseCoordPair(lat, lng);
+  const latNum = coords ? coords.lat : null;
+  const lngNum = coords ? coords.lng : null;
 
   const cols = ["id", "email", "companyName", "phone", "address", "passwordHash", "categoriesJson", "createdAt"];
   const vals = [
@@ -979,13 +1412,12 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
   }
   if (hasColumn("companies", "workingHoursJson")) {
     cols.push("workingHoursJson");
-    vals.push(workingHoursJson ? String(workingHoursJson) : null);
+    vals.push(hoursToStore);
   }
 
-  // ✅ NEW: servicesText column exists? Insert empty default (safe)
   if (hasColumn("companies", "servicesText")) {
     cols.push("servicesText");
-    vals.push("");
+    vals.push(servicesText);
   }
 
   const placeholders = cols.map(() => "?").join(", ");
@@ -1006,8 +1438,7 @@ app.post("/api/auth/register-company", rlRegister, (req, res) => {
       lat: Number.isFinite(latNum) ? latNum : null,
       lng: Number.isFinite(lngNum) ? lngNum : null,
       createdAt,
-      // ✅ NEW
-      servicesText: "",
+      servicesText,
     },
   });
 });
@@ -1024,10 +1455,10 @@ app.post("/api/auth/login-company", rlLogin, (req, res) => {
     const rows = db.prepare("SELECT * FROM companies WHERE companyName = ?").all(identifier);
     row = rows.length === 1 ? rows[0] : null;
   }
-  if (!row) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
 
-  const ok = bcrypt.compareSync(password, row.passwordHash);
-  if (!ok) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
+  // One counter per real account (e-mail and company name share it).
+  const accountKey = row ? `company:id:${row.id}` : `company:${identifier.toLowerCase()}`;
+  if (!checkLoginPassword(res, accountKey, row, password)) return;
 
   const token = signToken({ type: "company", companyId: row.id });
 
@@ -1085,7 +1516,10 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
   // Check email uniqueness only if email is being changed
   if (emailNew !== undefined) {
     const current = db.prepare("SELECT email FROM companies WHERE id = ?").get(companyId);
+    // Only a changed address must be valid: the dashboard always sends the
+    // stored one along, and an older (non-conforming) one must not block saves.
     if (current && normalizeEmail(current.email) !== emailNew) {
+      if (!isValidEmail(emailNew)) return res.status(400).json({ ok: false, error: "INVALID_EMAIL" });
       const taken =
         db.prepare("SELECT 1 FROM companies WHERE email = ? AND id != ?").get(emailNew, companyId) ||
         db.prepare("SELECT 1 FROM users WHERE email = ?").get(emailNew);
@@ -1108,23 +1542,28 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
     }
   }
 
-  const latNum = lat === null || lat === undefined || lat === "" ? null : Number(lat);
-  const lngNum = lng === null || lng === undefined || lng === "" ? null : Number(lng);
+  // Coordinates are only ever replaced by a complete, valid pair. Empty,
+  // partial or invalid values (e.g. the dashboard's empty fields after its
+  // data failed to load) keep the stored position, so a company can't vanish
+  // from the radius search by saving its profile.
+  const coords = parseCoordPair(lat, lng);
+
+  let hoursToStore;
+  if (workingHoursJson !== undefined) {
+    hoursToStore = normalizeWorkingHoursInput(workingHoursJson);
+    if (hoursToStore === undefined) return res.status(400).json({ ok: false, error: "INVALID_WORKING_HOURS" });
+  }
 
   const sets = [];
   const vals = [];
 
-  if (hasColumn("companies", "lat")) {
-    sets.push("lat = ?");
-    vals.push(Number.isFinite(latNum) ? latNum : null);
-  }
-  if (hasColumn("companies", "lng")) {
-    sets.push("lng = ?");
-    vals.push(Number.isFinite(lngNum) ? lngNum : null);
+  if (coords && hasColumn("companies", "lat") && hasColumn("companies", "lng")) {
+    sets.push("lat = ?", "lng = ?");
+    vals.push(coords.lat, coords.lng);
   }
   if (hasColumn("companies", "workingHoursJson") && workingHoursJson !== undefined) {
     sets.push("workingHoursJson = ?");
-    vals.push(workingHoursJson ? String(workingHoursJson) : null);
+    vals.push(hoursToStore);
   }
 
   // ✅ NEW: save servicesText
@@ -1159,7 +1598,9 @@ app.post("/api/company/update-profile", requireCompanyAuth, (req, res) => {
     vals.push(emailNew);
   }
 
-  if (!sets.length) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  // Nothing to change (e.g. only empty coordinates): a no-op success, as the
+  // endpoint always answered before coordinates became optional here.
+  if (!sets.length) return res.json({ ok: true });
 
   vals.push(companyId);
   db.prepare(`UPDATE companies SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
@@ -1194,12 +1635,19 @@ app.post("/api/auth/forgot-password", rlForgot, async (req, res) => {
   const lang = String(req.body?.lang || "en");
   const genericOk = { ok: true, message: msg(lang, "genericSent") };
 
-  if (!email) return res.json(genericOk);
+  // A malformed address never reaches the mail library; the answer is the
+  // same generic one, so it reveals nothing.
+  if (!email || !isValidEmail(email)) return res.json(genericOk);
+
+  // At most 3 reset e-mails per address per hour, whatever IP asks. The
+  // answer stays the same generic one, so it reveals nothing about the account.
+  if (resetMailsPerEmail.isBlocked(email)) return res.json(genericOk);
 
   const acc = findAccountByEmail(email);
   if (!acc) return res.json(genericOk);
 
   if (!hasSmtp()) return res.json(genericOk);
+  resetMailsPerEmail.hit(email);
 
   const rawToken = crypto.randomBytes(32).toString("hex");
   const tokenHash = sha256Hex(rawToken);
@@ -1214,6 +1662,10 @@ app.post("/api/auth/forgot-password", rlForgot, async (req, res) => {
   const publicBase = getPublicBaseUrl(req);
   const resetLink = `${publicBase}/reset-password?token=${encodeURIComponent(rawToken)}`;
 
+  // Answer first, send afterwards: waiting for SMTP only for existing
+  // accounts would reveal through the response time that the account exists.
+  res.json(genericOk);
+
   try {
     const transporter = getTransporter();
     await transporter.verify();
@@ -1226,8 +1678,6 @@ app.post("/api/auth/forgot-password", rlForgot, async (req, res) => {
   } catch (e) {
     console.log("❌ sendMail ERROR:", e?.message || e);
   }
-
-  return res.json(genericOk);
 });
 
 app.post("/api/auth/reset-password", rlReset, (req, res) => {
@@ -1521,6 +1971,102 @@ app.get("/api/companies/nearest", (req, res) => {
   });
 });
 
+// ======================
+// GEOCODING (address -> suggested position)
+// ======================
+// GET /api/geocode?q=<address>&lang=de
+// Only ever a SUGGESTION: the app shows it on a map and the company must
+// confirm (and may move) the pin; nothing is stored here.
+//
+// Provider: GEOCODER_PROVIDER = "nominatim" | "none" (default "none": the
+// public OpenStreetMap service is only used once it has been switched on
+// deliberately — see its usage policy). Its rules are kept server-side for
+// all users together: one request per explicit click (no autocomplete), at
+// most 1 request per second in total, an identifying User-Agent, results
+// cached, and a per-IP limit against misuse of this public endpoint.
+const GEOCODER_PROVIDER = String(process.env.GEOCODER_PROVIDER || "none").trim().toLowerCase();
+const NOMINATIM_URL = String(process.env.NOMINATIM_URL || "https://nominatim.openstreetmap.org").replace(/\/+$/, "");
+const GEOCODER_TIMEOUT_MS = Number(process.env.GEOCODER_TIMEOUT_MS || 6000);
+const GEOCODER_USER_AGENT = `AutoHelp-Server/1.0 (+${FIXED_PUBLIC_BASE_URL || "https://autohelp-server.onrender.com"})`;
+const GEOCODE_MIN_INTERVAL_MS = 1100;
+const GEOCODE_MAX_WAITING = 5;
+const GEOCODE_CACHE_MAX = 2000;
+const GEOCODE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const GEOCODE_EMPTY_TTL_MS = 24 * 60 * 60 * 1000;
+
+const rlGeocode = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "geocode" });
+const geocodeCache = new Map(); // key -> { at, ttl, results }
+let geocodeQueue = Promise.resolve();
+let geocodeWaiting = 0;
+let geocodeLastCallAt = 0;
+
+// Nominatim place_rank: 30 = building / house number, 26–29 = street, lower = area or city.
+function geocodePrecision(placeRank) {
+  const r = Number(placeRank);
+  if (r >= 30) return "exact";
+  if (r >= 26) return "street";
+  return "area";
+}
+
+async function callNominatim(q, lang) {
+  const url =
+    `${NOMINATIM_URL}/search?format=jsonv2&addressdetails=0&limit=3&q=${encodeURIComponent(q)}` +
+    (process.env.GEOCODER_EMAIL ? `&email=${encodeURIComponent(process.env.GEOCODER_EMAIL)}` : "");
+  const resp = await fetch(url, {
+    headers: { "User-Agent": GEOCODER_USER_AGENT, "Accept-Language": lang || "en" },
+    signal: AbortSignal.timeout(GEOCODER_TIMEOUT_MS),
+  });
+  if (!resp.ok) throw new Error(`GEOCODER_HTTP_${resp.status}`);
+  const list = await resp.json();
+  if (!Array.isArray(list)) throw new Error("GEOCODER_BAD_RESPONSE");
+  return list
+    .map((r) => ({ coords: parseCoordPair(r.lat, r.lon), label: String(r.display_name || ""), precision: geocodePrecision(r.place_rank) }))
+    .filter((r) => r.coords)
+    .map((r) => ({ lat: r.coords.lat, lng: r.coords.lng, label: r.label.slice(0, 300), precision: r.precision }));
+}
+
+// One provider call at a time, at least GEOCODE_MIN_INTERVAL_MS apart.
+function queuedGeocode(q, lang) {
+  if (geocodeWaiting >= GEOCODE_MAX_WAITING) return Promise.reject(httpError(503, "GEOCODER_BUSY"));
+  geocodeWaiting++;
+  const run = geocodeQueue.then(async () => {
+    const wait = geocodeLastCallAt + GEOCODE_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return await callNominatim(q, lang);
+    } finally {
+      geocodeLastCallAt = Date.now();
+      geocodeWaiting--;
+    }
+  });
+  geocodeQueue = run.catch(() => {});
+  return run;
+}
+
+app.get("/api/geocode", rlGeocode, async (req, res) => {
+  const q = String(req.query.q || "").replace(/\s+/g, " ").trim();
+  const lang = /^[a-z]{2}$/i.test(String(req.query.lang || "")) ? String(req.query.lang).toLowerCase() : "en";
+  if (q.length < 5 || q.length > 300 || /[\u0000-\u001f]/.test(q)) {
+    return res.status(400).json({ ok: false, error: "INVALID_ADDRESS" });
+  }
+  if (GEOCODER_PROVIDER !== "nominatim") return res.status(503).json({ ok: false, error: "GEOCODER_UNAVAILABLE" });
+
+  const key = `${lang}|${q.toLowerCase()}`;
+  const cached = geocodeCache.get(key);
+  if (cached && Date.now() - cached.at < cached.ttl) return res.json({ ok: true, results: cached.results, cached: true });
+
+  try {
+    const results = await queuedGeocode(q, lang);
+    if (geocodeCache.size >= GEOCODE_CACHE_MAX) geocodeCache.delete(geocodeCache.keys().next().value);
+    geocodeCache.set(key, { at: Date.now(), ttl: results.length ? GEOCODE_CACHE_TTL_MS : GEOCODE_EMPTY_TTL_MS, results });
+    return res.json({ ok: true, results });
+  } catch (e) {
+    if (e?.code === "GEOCODER_BUSY") return res.status(503).json({ ok: false, error: "GEOCODER_BUSY" });
+    console.error("geocode error:", e?.message || e);
+    return res.status(502).json({ ok: false, error: "GEOCODER_ERROR" });
+  }
+});
+
 // Company details
 app.get("/api/companies/:id", (req, res) => {
   const id = String(req.params.id || "").trim();
@@ -1565,7 +2111,12 @@ app.post("/api/ratings", requireUserAuth, (req, res) => {
   if (!serviceId || !Number.isInteger(value) || value < 1 || value > 5) {
     return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   }
+  if (!db.prepare("SELECT 1 FROM companies WHERE id = ?").get(serviceId)) {
+    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  }
 
+  // Kept as before for the installed apps: a second vote is refused (409).
+  // Changing a rating is PUT /api/ratings/:serviceId.
   const existing = db.prepare("SELECT id FROM ratings WHERE userId = ? AND serviceId = ?").get(userId, serviceId);
   if (existing) return res.status(409).json({ ok: false, error: "ALREADY_VOTED" });
 
@@ -1595,6 +2146,55 @@ app.post("/api/ratings", requireUserAuth, (req, res) => {
     rating: { id, serviceId, value, createdAt },
     stats: { average: Number(stats?.avg || 0), votes: Number(stats?.votes || 0) },
   });
+});
+
+function ratingStats(serviceId) {
+  const stats = db.prepare("SELECT AVG(value) as avg, COUNT(*) as votes FROM ratings WHERE serviceId = ?").get(serviceId);
+  return { average: Number(stats?.avg || 0), votes: Number(stats?.votes || 0) };
+}
+
+// GET /api/ratings/mine/:serviceId — the logged-in user's own rating of a company (or null)
+app.get("/api/ratings/mine/:serviceId", requireUserAuth, (req, res) => {
+  const serviceId = String(req.params.serviceId || "").trim();
+  const row = db
+    .prepare("SELECT id, serviceId, value, createdAt FROM ratings WHERE userId = ? AND serviceId = ?")
+    .get(req.user.userId, serviceId);
+  return res.json({ ok: true, serviceId, rating: row || null });
+});
+
+// PUT /api/ratings/:serviceId — set or change the user's own rating (1–5)
+app.put("/api/ratings/:serviceId", requireUserAuth, (req, res) => {
+  const userId = req.user.userId;
+  const serviceId = String(req.params.serviceId || "").trim();
+  const value = Number(req.body?.value);
+
+  if (!Number.isInteger(value) || value < 1 || value > 5) {
+    return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  }
+  if (!db.prepare("SELECT 1 FROM companies WHERE id = ?").get(serviceId)) {
+    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  }
+
+  // One row per user and company: change the existing rating or add it. Done
+  // in one synchronous transaction, so parallel requests can't duplicate it
+  // (and it doesn't depend on the table's UNIQUE constraint being present).
+  db.transaction(() => {
+    const changed = db.prepare("UPDATE ratings SET value = ? WHERE userId = ? AND serviceId = ?").run(value, userId, serviceId);
+    if (changed.changes === 0) {
+      db.prepare("INSERT INTO ratings (id, userId, serviceId, value, createdAt) VALUES (?, ?, ?, ?, ?)").run(
+        createId("r"),
+        userId,
+        serviceId,
+        value,
+        nowMs()
+      );
+    }
+  })();
+
+  const rating = db
+    .prepare("SELECT id, serviceId, value, createdAt FROM ratings WHERE userId = ? AND serviceId = ?")
+    .get(userId, serviceId);
+  return res.json({ ok: true, rating, stats: ratingStats(serviceId) });
 });
 
 app.get("/api/ratings/stats/:serviceId", (req, res) => {
@@ -1695,8 +2295,16 @@ app.get("/api/user/me", requireUserAuth, (req, res) => {
 app.put("/api/user/me", requireUserAuth, (req, res) => {
   const email = normalizeEmail(req.body.email || "");
   if (!email) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  const current = db.prepare("SELECT email FROM users WHERE id = ?").get(req.user.userId);
+  if (normalizeEmail(current?.email) !== email && !isValidEmail(email)) {
+    return res.status(400).json({ ok: false, error: "INVALID_EMAIL" });
+  }
 
-  const existing = db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, req.user.userId);
+  // A company's address too: one e-mail belongs to one account, otherwise a
+  // password reset for it would reach the driver and never the company.
+  const existing =
+    db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, req.user.userId) ||
+    db.prepare("SELECT id FROM companies WHERE email = ?").get(email);
   if (existing) return res.status(409).json({ ok: false, error: "EMAIL_EXISTS" });
 
   db.prepare("UPDATE users SET email = ? WHERE id = ?").run(email, req.user.userId);
@@ -1709,11 +2317,21 @@ app.put("/api/user/password", requireUserAuth, (req, res) => {
   if (!currentPassword || !newPassword) return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
   if (String(newPassword).length < 6) return res.status(400).json({ ok: false, error: "PASS_TOO_SHORT" });
 
+  // Own counter, separate from login: failed logins by others don't block a
+  // password change, and vice versa.
+  const accountKey = `user:${req.user.userId}`;
+  const wait = passwordChangeThrottle.retryAfterMs(accountKey);
+  if (wait > 0) return sendRateLimited(res, wait);
+
   const user = db.prepare("SELECT passwordHash FROM users WHERE id = ?").get(req.user.userId);
   if (!user) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
   const match = bcrypt.compareSync(String(currentPassword), user.passwordHash);
-  if (!match) return res.status(401).json({ ok: false, error: "WRONG_PASSWORD" });
+  if (!match) {
+    passwordChangeThrottle.fail(accountKey);
+    return res.status(401).json({ ok: false, error: "WRONG_PASSWORD" });
+  }
+  passwordChangeThrottle.clear(accountKey);
 
   const hashed = bcrypt.hashSync(String(newPassword), 10);
   db.prepare("UPDATE users SET passwordHash = ? WHERE id = ?").run(hashed, req.user.userId);
@@ -1819,6 +2437,33 @@ app.delete("/api/user/vehicles/:id", requireUserAuth, (req, res) => {
 
   db.prepare("DELETE FROM vehicles WHERE id = ?").run(id);
   return res.json({ ok: true });
+});
+
+// ======================
+// ERRORS (always JSON, never a stack trace or internal path)
+// ======================
+app.use("/api", (req, res) => res.status(404).json({ ok: false, error: "NOT_FOUND" }));
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ ok: false, error: "FILE_TOO_LARGE" });
+    if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({ ok: false, error: "TOO_MANY_FILES" });
+    }
+    return res.status(400).json({ ok: false, error: "INVALID_UPLOAD" });
+  }
+  if (err?.type === "entity.parse.failed") return res.status(400).json({ ok: false, error: "INVALID_JSON" });
+  if (err?.type === "entity.too.large") return res.status(413).json({ ok: false, error: "PAYLOAD_TOO_LARGE" });
+  // Our own httpError(...) values (CORS_NOT_ALLOWED, INVALID_UPLOAD)
+  if (err?.status >= 400 && err.status < 500 && /^[A-Z_]+$/.test(String(err.code || ""))) {
+    return res.status(err.status).json({ ok: false, error: err.code });
+  }
+  if (err?.status === 400 || err?.statusCode === 400) return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
+
+  console.error("Unhandled error:", req.method, req.originalUrl.split("?")[0], err?.message || err);
+  return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
 });
 
 // ======================
