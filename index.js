@@ -606,6 +606,69 @@ try {
   console.log("⚠️ Migration warning:", e?.message || e);
 }
 
+// Digital Garage (migration, additive only: existing rows keep every value,
+// new columns start empty). A missing column is added; nothing is renamed or
+// dropped, so an older server version can still run on the same database.
+//   plate              registration plate, as typed (normalised to upper case)
+//   current_km         last odometer reading the driver entered
+//   current_km_at      when it was entered (ms)
+//   timing_drive       "belt" | "chain" | "unknown" | "none" (NULL = not chosen yet)
+//   odometer_reminder  1 = the driver asked to be reminded to update the odometer (default off)
+//   client_ref         the app's own id for a "create" request, so a resent request
+//                      returns the vehicle it already created instead of a second one
+try {
+  addColumnIfMissing("vehicles", "plate TEXT");
+  addColumnIfMissing("vehicles", "current_km INTEGER");
+  addColumnIfMissing("vehicles", "current_km_at INTEGER");
+  addColumnIfMissing("vehicles", "timing_drive TEXT");
+  addColumnIfMissing("vehicles", "odometer_reminder INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing("vehicles", "client_ref TEXT");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_vehicles_client_ref
+      ON vehicles(user_id, client_ref) WHERE client_ref IS NOT NULL;
+
+    -- The driver's own interval per vehicle and kind (no built-in defaults:
+    -- intervals depend on the car). At least one of km / months is set.
+    CREATE TABLE IF NOT EXISTS service_plans (
+      vehicle_id          INTEGER NOT NULL,
+      user_id             TEXT NOT NULL,
+      kind                TEXT NOT NULL CHECK (kind IN ('oil','major')),
+      interval_km         INTEGER,
+      interval_months     INTEGER,
+      remind_days_before  INTEGER NOT NULL DEFAULT 30,
+      created_at          INTEGER NOT NULL,
+      updated_at          INTEGER NOT NULL,
+      PRIMARY KEY (vehicle_id, kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_service_plans_user ON service_plans(user_id);
+
+    -- Full service history: every service is its own row and is never
+    -- overwritten by a later one. The next due service is always derived from
+    -- the latest record + the plan, so editing or deleting a record can't
+    -- leave a stale "next due" behind.
+    CREATE TABLE IF NOT EXISTS service_records (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      vehicle_id    INTEGER NOT NULL,
+      user_id       TEXT NOT NULL,
+      kind          TEXT NOT NULL CHECK (kind IN ('oil','major')),
+      service_date  TEXT NOT NULL,
+      km            INTEGER,
+      items_json    TEXT NOT NULL DEFAULT '[]',
+      oil_spec      TEXT,
+      note          TEXT,
+      client_ref    TEXT,
+      created_at    INTEGER NOT NULL,
+      updated_at    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_service_records_vehicle ON service_records(vehicle_id, kind, service_date);
+    CREATE INDEX IF NOT EXISTS idx_service_records_user ON service_records(user_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_service_records_client_ref
+      ON service_records(user_id, client_ref) WHERE client_ref IS NOT NULL;
+  `);
+} catch (e) {
+  console.log("⚠️ Migration warning:", e?.message || e);
+}
+
 // Cleanup expired resets periodically
 setInterval(() => {
   try {
@@ -1715,6 +1778,8 @@ app.delete("/api/auth/delete-user", requireUserAuth, (req, res) => {
   const deleteAccount = db.transaction(() => {
     db.prepare("DELETE FROM password_resets WHERE accountType = 'user' AND accountId = ?").run(userId);
     db.prepare("DELETE FROM ratings WHERE userId = ?").run(userId);
+    db.prepare("DELETE FROM service_records WHERE user_id = ?").run(userId);
+    db.prepare("DELETE FROM service_plans WHERE user_id = ?").run(userId);
     db.prepare("DELETE FROM vehicles WHERE user_id = ?").run(userId);
     db.prepare("DELETE FROM users WHERE id = ?").run(userId);
   });
@@ -2360,6 +2425,284 @@ function parsePickerlFields(monthRaw, yearRaw) {
   return { month, year };
 }
 
+// ======================
+// DIGITAL GARAGE — shared rules
+// ======================
+// Every garage row belongs to one vehicle AND one user; every route checks
+// both. New vehicle fields follow the Pickerl rule above: a key that is not
+// in the request keeps its stored value (installed app versions don't know
+// these fields and must never wipe them); an explicit null clears it.
+const VEHICLE_LIMIT = 5;
+const SERVICE_RECORD_LIMIT = 500; // per vehicle
+const SERVICE_KINDS = ["oil", "major"];
+const TIMING_DRIVES = ["belt", "chain", "unknown", "none"];
+const REMIND_DAYS_CHOICES = [7, 14, 30, 60];
+const DEFAULT_REMIND_DAYS = 30;
+const MAX_KM = 2000000;
+const INTERVAL_KM_MIN = 500;
+const INTERVAL_KM_MAX = 500000;
+const INTERVAL_MONTHS_MIN = 1;
+const INTERVAL_MONTHS_MAX = 240;
+// Parts per kind. Order here is the order they are stored and returned in.
+const SERVICE_ITEMS = {
+  oil: ["engine_oil", "oil_filter", "air_filter", "cabin_filter", "fuel_filter"],
+  major: ["timing_belt", "timing_chain", "tensioner_pulleys", "water_pump", "serpentine_belt"],
+};
+
+const hasKey = (obj, key) => !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+const isBlank = (v) => v === null || v === undefined || (typeof v === "string" && v.trim() === "");
+
+// Whole number from a JSON number or a plain digit string ("120000"); never
+// "120.000" (read as 120 by Number()) or "1e5". Returns NaN when invalid.
+function toWholeNumber(raw) {
+  if (typeof raw === "number") return Number.isInteger(raw) ? raw : NaN;
+  if (typeof raw === "string" && /^\d{1,9}$/.test(raw.trim())) return Number(raw.trim());
+  return NaN;
+}
+
+function parseKm(raw, code) {
+  if (isBlank(raw)) return { value: null };
+  const n = toWholeNumber(raw);
+  if (!Number.isInteger(n) || n < 0 || n > MAX_KM) return { error: code };
+  return { value: n };
+}
+
+function parsePlate(raw) {
+  if (isBlank(raw)) return { value: null };
+  if (typeof raw !== "string") return { error: "INVALID_PLATE" };
+  const s = raw.trim().replace(/\s+/g, " ").toLocaleUpperCase("de-AT");
+  if (s.length > 16 || !/^[\p{L}\p{N}][\p{L}\p{N} .-]*$/u.test(s)) return { error: "INVALID_PLATE" };
+  return { value: s };
+}
+
+function parseTimingDrive(raw) {
+  if (isBlank(raw)) return { value: null };
+  if (!TIMING_DRIVES.includes(raw)) return { error: "INVALID_TIMING_DRIVE" };
+  return { value: raw };
+}
+
+function parseFlag(raw, code) {
+  if (raw === true || raw === 1) return { value: 1 };
+  if (raw === false || raw === 0) return { value: 0 };
+  return { error: code };
+}
+
+function parseClientRef(raw) {
+  if (raw === undefined || raw === null) return { value: null };
+  if (typeof raw !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(raw)) return { error: "INVALID_CLIENT_REF" };
+  return { value: raw };
+}
+
+function parseText(raw, maxLen, code) {
+  if (isBlank(raw)) return { value: null };
+  if (typeof raw !== "string") return { error: code };
+  const s = raw.trim();
+  if (s.length > maxLen) return { error: code };
+  return { value: s };
+}
+
+// Today's calendar date in Vienna ("YYYY-MM-DD"), whatever the server's own zone.
+const viennaDateFormat = new Intl.DateTimeFormat("en-CA", {
+  timeZone: BUSINESS_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+function viennaToday(now = new Date()) {
+  const p = Object.fromEntries(viennaDateFormat.formatToParts(now).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+// A real calendar date "YYYY-MM-DD" from 1950 up to tomorrow in Vienna (one
+// day of slack for a phone in a time zone ahead of Vienna). Never in the future.
+function parseServiceDate(raw) {
+  if (typeof raw !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return { error: "INVALID_DATE" };
+  const [y, m, d] = raw.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return { error: "INVALID_DATE" };
+  if (raw < "1950-01-01") return { error: "INVALID_DATE" };
+  const latest = viennaToday(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  if (raw > latest) return { error: "DATE_IN_FUTURE" };
+  return { value: raw };
+}
+
+function parseItems(raw, kind) {
+  if (raw === undefined || raw === null) return { value: [] };
+  if (!Array.isArray(raw) || raw.length > 20) return { error: "INVALID_ITEMS" };
+  const allowed = SERVICE_ITEMS[kind];
+  for (const it of raw) if (!allowed.includes(it)) return { error: "INVALID_ITEMS" };
+  return { value: allowed.filter((it) => raw.includes(it)) };
+}
+
+function parseIntervalKm(raw) {
+  if (raw === null) return { value: null };
+  const n = toWholeNumber(raw);
+  if (!Number.isInteger(n) || n < INTERVAL_KM_MIN || n > INTERVAL_KM_MAX) return { error: "INVALID_INTERVAL_KM" };
+  return { value: n };
+}
+
+function parseIntervalMonths(raw) {
+  if (raw === null) return { value: null };
+  const n = toWholeNumber(raw);
+  if (!Number.isInteger(n) || n < INTERVAL_MONTHS_MIN || n > INTERVAL_MONTHS_MAX) return { error: "INVALID_INTERVAL_MONTHS" };
+  return { value: n };
+}
+
+function parseRemindDays(raw) {
+  const n = toWholeNumber(raw);
+  if (!REMIND_DAYS_CHOICES.includes(n)) return { error: "INVALID_REMIND_DAYS" };
+  return { value: n };
+}
+
+// Garage fields of a vehicle request. `stored` = the current row (update) or
+// null (create). Absent keys keep `stored` values. The odometer is set only
+// on create; afterwards it changes only through PATCH .../odometer, which
+// knows the rules for a lower reading.
+function readGarageVehicleFields(body, stored) {
+  const out = {
+    plate: stored ? stored.plate : null,
+    timing_drive: stored ? stored.timing_drive : null,
+    odometer_reminder: stored ? stored.odometer_reminder ?? 0 : 0,
+  };
+  if (hasKey(body, "plate")) {
+    const r = parsePlate(body.plate);
+    if (r.error) return { error: r.error };
+    out.plate = r.value;
+  }
+  if (hasKey(body, "timing_drive")) {
+    const r = parseTimingDrive(body.timing_drive);
+    if (r.error) return { error: r.error };
+    out.timing_drive = r.value;
+  }
+  if (hasKey(body, "odometer_reminder")) {
+    const r = parseFlag(body.odometer_reminder, "INVALID_ODOMETER_REMINDER");
+    if (r.error) return { error: r.error };
+    out.odometer_reminder = r.value;
+  }
+  if (!stored && hasKey(body, "current_km")) {
+    const r = parseKm(body.current_km, "INVALID_KM");
+    if (r.error) return { error: r.error };
+    out.current_km = r.value;
+  }
+  return { values: out };
+}
+
+// Loads :id and checks it belongs to the signed-in user. Answers the request
+// itself (400 / 404 / 403 — the same codes the vehicle routes always used)
+// and returns null when the caller must stop.
+function ownedVehicle(req, res) {
+  const id = toWholeNumber(String(req.params.id ?? ""));
+  if (!Number.isInteger(id) || id < 1) {
+    res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+    return null;
+  }
+  const vehicle = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(id);
+  if (!vehicle) {
+    res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    return null;
+  }
+  if (vehicle.user_id !== req.user.userId) {
+    res.status(403).json({ ok: false, error: "FORBIDDEN" });
+    return null;
+  }
+  return vehicle;
+}
+
+function serviceKindParam(req, res) {
+  const kind = String(req.params.kind || "");
+  if (!SERVICE_KINDS.includes(kind)) {
+    res.status(400).json({ ok: false, error: "INVALID_KIND" });
+    return null;
+  }
+  return kind;
+}
+
+// Highest odometer value the garage knows for a vehicle: the last reading or
+// the highest km of any service record.
+function knownMaxKm(vehicle) {
+  const row = db.prepare("SELECT MAX(km) AS m FROM service_records WHERE vehicle_id = ? AND user_id = ?").get(vehicle.id, vehicle.user_id);
+  const values = [vehicle.current_km, row?.m].filter((v) => Number.isInteger(v));
+  return values.length ? Math.max(...values) : null;
+}
+
+// A service done at a higher km than the last reading moves the reading up
+// (never down): the car has at least that many km.
+function raiseOdometer(vehicleId, userId, km) {
+  if (!Number.isInteger(km)) return;
+  db.prepare(
+    "UPDATE vehicles SET current_km = ?, current_km_at = ? WHERE id = ? AND user_id = ? AND (current_km IS NULL OR current_km < ?)"
+  ).run(km, nowMs(), vehicleId, userId, km);
+}
+
+function planOut(row) {
+  if (!row) return null;
+  return {
+    kind: row.kind,
+    interval_km: row.interval_km ?? null,
+    interval_months: row.interval_months ?? null,
+    remind_days_before: row.remind_days_before,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function plansFor(vehicle) {
+  const rows = db.prepare("SELECT * FROM service_plans WHERE vehicle_id = ? AND user_id = ?").all(vehicle.id, vehicle.user_id);
+  const plans = { oil: null, major: null };
+  for (const r of rows) plans[r.kind] = planOut(r);
+  return plans;
+}
+
+function recordOut(row) {
+  let items = [];
+  try {
+    const parsed = JSON.parse(row.items_json || "[]");
+    if (Array.isArray(parsed)) items = parsed.filter((x) => typeof x === "string");
+  } catch {}
+  return {
+    id: row.id,
+    vehicle_id: row.vehicle_id,
+    kind: row.kind,
+    service_date: row.service_date,
+    km: row.km ?? null,
+    items,
+    oil_spec: row.oil_spec ?? null,
+    note: row.note ?? null,
+    client_ref: row.client_ref ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+// Newest first: by date, then km, then entry order.
+function recordsFor(vehicle, kind = null) {
+  const rows = kind
+    ? db.prepare(
+        "SELECT * FROM service_records WHERE vehicle_id = ? AND user_id = ? AND kind = ? ORDER BY service_date DESC, km IS NULL, km DESC, id DESC"
+      ).all(vehicle.id, vehicle.user_id, kind)
+    : db.prepare(
+        "SELECT * FROM service_records WHERE vehicle_id = ? AND user_id = ? ORDER BY service_date DESC, km IS NULL, km DESC, id DESC"
+      ).all(vehicle.id, vehicle.user_id);
+  return rows.map(recordOut);
+}
+
+function ownedRecord(req, res, vehicle) {
+  const id = toWholeNumber(String(req.params.recordId ?? ""));
+  if (!Number.isInteger(id) || id < 1) {
+    res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+    return null;
+  }
+  // Only inside this vehicle of this user: another user's record id is simply "not found".
+  const row = db.prepare("SELECT * FROM service_records WHERE id = ? AND vehicle_id = ? AND user_id = ?").get(id, vehicle.id, vehicle.user_id);
+  if (!row) {
+    res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    return null;
+  }
+  return row;
+}
+
+const isUniqueViolation = (e) => /UNIQUE constraint failed/i.test(String(e?.message || ""));
+
 // GET /api/user/vehicles — всички автомобили на потребителя
 app.get("/api/user/vehicles", requireUserAuth, (req, res) => {
   const vehicles = db.prepare("SELECT * FROM vehicles WHERE user_id = ? ORDER BY created_at ASC").all(req.user.userId);
@@ -2380,9 +2723,44 @@ app.post("/api/user/vehicles", requireUserAuth, (req, res) => {
   const pickerl = parsePickerlFields(req.body?.pickerl_month, req.body?.pickerl_year);
   if (pickerl.error) return res.status(400).json({ ok: false, error: pickerl.error });
 
-  const result = db.prepare(
-    "INSERT INTO vehicles (user_id, make, model, reg_month, reg_year, pickerl_month, pickerl_year) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).run(req.user.userId, makeStr || null, modelStr || null, month, year, pickerl.month, pickerl.year);
+  const garage = readGarageVehicleFields(req.body, null);
+  if (garage.error) return res.status(400).json({ ok: false, error: garage.error });
+  const ref = parseClientRef(req.body?.client_ref);
+  if (ref.error) return res.status(400).json({ ok: false, error: ref.error });
+
+  const userId = req.user.userId;
+  const findByRef = () => db.prepare("SELECT * FROM vehicles WHERE user_id = ? AND client_ref = ?").get(userId, ref.value);
+  // A resent "create" (same client_ref) answers with the vehicle it already made.
+  if (ref.value) {
+    const existing = findByRef();
+    if (existing) return res.status(200).json({ ok: true, vehicle: existing, replayed: true });
+  }
+
+  const g = garage.values;
+  const kmAt = Number.isInteger(g.current_km) ? nowMs() : null;
+  const insert = db.transaction(() => {
+    const count = db.prepare("SELECT COUNT(*) AS n FROM vehicles WHERE user_id = ?").get(userId).n;
+    if (count >= VEHICLE_LIMIT) return null;
+    return db.prepare(
+      `INSERT INTO vehicles (user_id, make, model, reg_month, reg_year, pickerl_month, pickerl_year,
+         plate, current_km, current_km_at, timing_drive, odometer_reminder, client_ref)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(userId, makeStr || null, modelStr || null, month, year, pickerl.month, pickerl.year,
+      g.plate, g.current_km ?? null, kmAt, g.timing_drive, g.odometer_reminder, ref.value);
+  });
+
+  let result;
+  try {
+    result = insert();
+  } catch (e) {
+    // The same client_ref arrived twice at the same moment: the first one won.
+    if (ref.value && isUniqueViolation(e)) {
+      const existing = findByRef();
+      if (existing) return res.status(200).json({ ok: true, vehicle: existing, replayed: true });
+    }
+    throw e;
+  }
+  if (!result) return res.status(409).json({ ok: false, error: "VEHICLE_LIMIT", limit: VEHICLE_LIMIT });
 
   const vehicle = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(result.lastInsertRowid);
   return res.status(201).json({ ok: true, vehicle });
@@ -2418,9 +2796,19 @@ app.put("/api/user/vehicles/:id", requireUserAuth, (req, res) => {
     : { month: stored?.pickerl_month ?? null, year: stored?.pickerl_year ?? null };
   if (pickerl.error) return res.status(400).json({ ok: false, error: pickerl.error });
 
+  // Garage fields: same rule as Pickerl above — a key the app didn't send
+  // keeps the stored value (installed versions don't know these fields).
+  // The odometer is not changed here (see PATCH .../odometer).
+  const storedGarage = db.prepare("SELECT plate, timing_drive, odometer_reminder FROM vehicles WHERE id = ?").get(id);
+  const garage = readGarageVehicleFields(body, storedGarage);
+  if (garage.error) return res.status(400).json({ ok: false, error: garage.error });
+  const g = garage.values;
+
   db.prepare(
-    "UPDATE vehicles SET make = ?, model = ?, reg_month = ?, reg_year = ?, pickerl_month = ?, pickerl_year = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-  ).run(makeStr || null, modelStr || null, month, year, pickerl.month, pickerl.year, id);
+    `UPDATE vehicles SET make = ?, model = ?, reg_month = ?, reg_year = ?, pickerl_month = ?, pickerl_year = ?,
+       plate = ?, timing_drive = ?, odometer_reminder = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+  ).run(makeStr || null, modelStr || null, month, year, pickerl.month, pickerl.year,
+    g.plate, g.timing_drive, g.odometer_reminder, id);
 
   const updated = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(id);
   return res.json({ ok: true, vehicle: updated });
@@ -2435,7 +2823,287 @@ app.delete("/api/user/vehicles/:id", requireUserAuth, (req, res) => {
   if (!vehicle) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   if (vehicle.user_id !== req.user.userId) return res.status(403).json({ ok: false, error: "FORBIDDEN" });
 
-  db.prepare("DELETE FROM vehicles WHERE id = ?").run(id);
+  // The vehicle's service plans and history go with it, in one transaction
+  // (the schema has no foreign keys, so nothing would remove them otherwise).
+  db.transaction(() => {
+    db.prepare("DELETE FROM service_records WHERE vehicle_id = ? AND user_id = ?").run(id, vehicle.user_id);
+    db.prepare("DELETE FROM service_plans WHERE vehicle_id = ? AND user_id = ?").run(id, vehicle.user_id);
+    db.prepare("DELETE FROM vehicles WHERE id = ?").run(id);
+  })();
+  return res.json({ ok: true });
+});
+
+// ======================
+// DIGITAL GARAGE — routes
+// ======================
+
+// GET /api/user/garage — every vehicle of the user with its plans and full
+// history in one answer (dashboard start, reminder re-sync after a new phone).
+app.get("/api/user/garage", requireUserAuth, (req, res) => {
+  const vehicles = db.prepare("SELECT * FROM vehicles WHERE user_id = ? ORDER BY created_at ASC, id ASC").all(req.user.userId);
+  return res.json({
+    ok: true,
+    limit: VEHICLE_LIMIT,
+    vehicles: vehicles.map((v) => ({ vehicle: v, plans: plansFor(v), records: recordsFor(v) })),
+  });
+});
+
+// GET /api/user/vehicles/:id/services — one vehicle: plans + full history.
+app.get("/api/user/vehicles/:id/services", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  return res.json({ ok: true, vehicle, plans: plansFor(vehicle), records: recordsFor(vehicle) });
+});
+
+// PATCH /api/user/vehicles/:id/odometer  { km, confirm_decrease? }
+// A reading below what the garage already knows (last reading or a service
+// record) is refused with 409 ODOMETER_DECREASE unless confirm_decrease is
+// true (e.g. a replaced instrument cluster or a typo being corrected).
+app.patch("/api/user/vehicles/:id/odometer", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const body = req.body || {};
+  if (isBlank(body.km)) return res.status(400).json({ ok: false, error: "INVALID_KM" });
+  const km = parseKm(body.km, "INVALID_KM");
+  if (km.error) return res.status(400).json({ ok: false, error: km.error });
+  if (hasKey(body, "confirm_decrease") && typeof body.confirm_decrease !== "boolean") {
+    return res.status(400).json({ ok: false, error: "INVALID_INPUT" });
+  }
+
+  const known = knownMaxKm(vehicle);
+  if (known !== null && km.value < known && body.confirm_decrease !== true) {
+    return res.status(409).json({ ok: false, error: "ODOMETER_DECREASE", known_km: known });
+  }
+
+  db.prepare("UPDATE vehicles SET current_km = ?, current_km_at = ? WHERE id = ? AND user_id = ?").run(km.value, nowMs(), vehicle.id, vehicle.user_id);
+  const updated = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(vehicle.id);
+  return res.json({ ok: true, vehicle: updated });
+});
+
+// GET /api/user/vehicles/:id/service-plans
+app.get("/api/user/vehicles/:id/service-plans", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  return res.json({ ok: true, plans: plansFor(vehicle) });
+});
+
+// PUT /api/user/vehicles/:id/service-plans/:kind
+//   { interval_km?, interval_months?, remind_days_before? }
+// Creates or updates the driver's own interval. A key that isn't sent keeps
+// its stored value; null clears it; at least one of km / months must remain.
+// Repeating the same request gives the same result (no duplicates: one plan
+// per vehicle and kind).
+app.put("/api/user/vehicles/:id/service-plans/:kind", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const kind = serviceKindParam(req, res);
+  if (!kind) return;
+  const body = req.body || {};
+
+  const stored = db.prepare("SELECT * FROM service_plans WHERE vehicle_id = ? AND user_id = ? AND kind = ?").get(vehicle.id, vehicle.user_id, kind);
+  const next = {
+    interval_km: stored ? stored.interval_km : null,
+    interval_months: stored ? stored.interval_months : null,
+    remind_days_before: stored ? stored.remind_days_before : DEFAULT_REMIND_DAYS,
+  };
+  if (hasKey(body, "interval_km")) {
+    const r = parseIntervalKm(body.interval_km);
+    if (r.error) return res.status(400).json({ ok: false, error: r.error });
+    next.interval_km = r.value;
+  }
+  if (hasKey(body, "interval_months")) {
+    const r = parseIntervalMonths(body.interval_months);
+    if (r.error) return res.status(400).json({ ok: false, error: r.error });
+    next.interval_months = r.value;
+  }
+  if (hasKey(body, "remind_days_before")) {
+    const r = parseRemindDays(body.remind_days_before);
+    if (r.error) return res.status(400).json({ ok: false, error: r.error });
+    next.remind_days_before = r.value;
+  }
+  if (next.interval_km === null && next.interval_months === null) {
+    return res.status(400).json({ ok: false, error: "INTERVAL_REQUIRED" });
+  }
+
+  const now = nowMs();
+  db.prepare(
+    `INSERT INTO service_plans (vehicle_id, user_id, kind, interval_km, interval_months, remind_days_before, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(vehicle_id, kind) DO UPDATE SET
+       interval_km = excluded.interval_km,
+       interval_months = excluded.interval_months,
+       remind_days_before = excluded.remind_days_before,
+       updated_at = excluded.updated_at`
+  ).run(vehicle.id, vehicle.user_id, kind, next.interval_km, next.interval_months, next.remind_days_before, now, now);
+
+  return res.json({ ok: true, plan: plansFor(vehicle)[kind] });
+});
+
+// DELETE /api/user/vehicles/:id/service-plans/:kind — no interval any more
+// (no reminders). The history stays.
+app.delete("/api/user/vehicles/:id/service-plans/:kind", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const kind = serviceKindParam(req, res);
+  if (!kind) return;
+  db.prepare("DELETE FROM service_plans WHERE vehicle_id = ? AND user_id = ? AND kind = ?").run(vehicle.id, vehicle.user_id, kind);
+  return res.json({ ok: true, plans: plansFor(vehicle) });
+});
+
+// GET /api/user/vehicles/:id/service-records[?kind=oil|major] — full history, newest first.
+app.get("/api/user/vehicles/:id/service-records", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const kind = req.query.kind === undefined ? null : String(req.query.kind);
+  if (kind !== null && !SERVICE_KINDS.includes(kind)) return res.status(400).json({ ok: false, error: "INVALID_KIND" });
+  return res.json({ ok: true, records: recordsFor(vehicle, kind) });
+});
+
+// Validated fields of a record request. `stored` = existing row (update) or
+// null (create). Absent keys keep the stored value; on create, kind and
+// service_date are required.
+function readRecordFields(body, stored) {
+  const kind = stored ? stored.kind : body.kind;
+  if (!SERVICE_KINDS.includes(kind)) return { error: "INVALID_KIND" };
+  if (stored && hasKey(body, "kind") && body.kind !== stored.kind) return { error: "KIND_IMMUTABLE" };
+
+  const out = {
+    kind,
+    service_date: stored ? stored.service_date : null,
+    km: stored ? stored.km : null,
+    items: stored ? recordOut(stored).items : [],
+    oil_spec: stored ? stored.oil_spec : null,
+    note: stored ? stored.note : null,
+  };
+
+  if (!stored || hasKey(body, "service_date")) {
+    const r = parseServiceDate(body.service_date);
+    if (r.error) return { error: r.error };
+    out.service_date = r.value;
+  }
+  if (hasKey(body, "km")) {
+    const r = parseKm(body.km, "INVALID_KM");
+    if (r.error) return { error: r.error };
+    out.km = r.value;
+  }
+  if (hasKey(body, "items")) {
+    const r = parseItems(body.items, kind);
+    if (r.error) return { error: r.error };
+    out.items = r.value;
+  }
+  if (hasKey(body, "oil_spec")) {
+    const r = parseText(body.oil_spec, 60, "INVALID_OIL_SPEC");
+    if (r.error) return { error: r.error };
+    if (r.value !== null && kind !== "oil") return { error: "INVALID_OIL_SPEC" };
+    out.oil_spec = r.value;
+  }
+  if (hasKey(body, "note")) {
+    const r = parseText(body.note, 1000, "INVALID_NOTE");
+    if (r.error) return { error: r.error };
+    out.note = r.value;
+  }
+  return { values: out };
+}
+
+// POST /api/user/vehicles/:id/service-records
+//   { kind, service_date, km?, items?, oil_spec?, note?, client_ref? }
+// "Service done" and "add an older service" both land here. Earlier records
+// are never touched; plans aren't changed (the next due date is derived from
+// the newest record). A resent request with the same client_ref returns the
+// record it already created (200, replayed: true) instead of a duplicate.
+app.post("/api/user/vehicles/:id/service-records", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const body = req.body || {};
+
+  const ref = parseClientRef(body.client_ref);
+  if (ref.error) return res.status(400).json({ ok: false, error: ref.error });
+  const findByRef = () => db.prepare("SELECT * FROM service_records WHERE user_id = ? AND client_ref = ?").get(vehicle.user_id, ref.value);
+  const replay = (row) =>
+    row.vehicle_id === vehicle.id
+      ? res.status(200).json({ ok: true, record: recordOut(row), vehicle: db.prepare("SELECT * FROM vehicles WHERE id = ?").get(vehicle.id), replayed: true })
+      : res.status(409).json({ ok: false, error: "CLIENT_REF_CONFLICT" });
+  if (ref.value) {
+    const existing = findByRef();
+    if (existing) return replay(existing);
+  }
+
+  const fields = readRecordFields(body, null);
+  if (fields.error) return res.status(400).json({ ok: false, error: fields.error });
+  const f = fields.values;
+
+  const create = db.transaction(() => {
+    const count = db.prepare("SELECT COUNT(*) AS n FROM service_records WHERE vehicle_id = ? AND user_id = ?").get(vehicle.id, vehicle.user_id).n;
+    if (count >= SERVICE_RECORD_LIMIT) return null;
+    const now = nowMs();
+    const r = db.prepare(
+      `INSERT INTO service_records (vehicle_id, user_id, kind, service_date, km, items_json, oil_spec, note, client_ref, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(vehicle.id, vehicle.user_id, f.kind, f.service_date, f.km, JSON.stringify(f.items), f.oil_spec, f.note, ref.value, now, now);
+    raiseOdometer(vehicle.id, vehicle.user_id, f.km);
+    return r;
+  });
+
+  let result;
+  try {
+    result = create();
+  } catch (e) {
+    if (ref.value && isUniqueViolation(e)) {
+      const existing = findByRef();
+      if (existing) return replay(existing);
+    }
+    throw e;
+  }
+  if (!result) return res.status(409).json({ ok: false, error: "RECORD_LIMIT", limit: SERVICE_RECORD_LIMIT });
+
+  const row = db.prepare("SELECT * FROM service_records WHERE id = ?").get(result.lastInsertRowid);
+  const updatedVehicle = db.prepare("SELECT * FROM vehicles WHERE id = ?").get(vehicle.id);
+  return res.status(201).json({ ok: true, record: recordOut(row), vehicle: updatedVehicle });
+});
+
+// GET /api/user/vehicles/:id/service-records/:recordId — details.
+app.get("/api/user/vehicles/:id/service-records/:recordId", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const row = ownedRecord(req, res, vehicle);
+  if (!row) return;
+  return res.json({ ok: true, record: recordOut(row) });
+});
+
+// PUT /api/user/vehicles/:id/service-records/:recordId — edit. Absent keys
+// keep their values; the kind can't change. Other records and the plan are
+// untouched, so editing the newest record simply moves the derived next due
+// date. The odometer only ever moves up (as on create).
+app.put("/api/user/vehicles/:id/service-records/:recordId", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const row = ownedRecord(req, res, vehicle);
+  if (!row) return;
+
+  const fields = readRecordFields(req.body || {}, row);
+  if (fields.error) return res.status(400).json({ ok: false, error: fields.error });
+  const f = fields.values;
+
+  db.transaction(() => {
+    db.prepare(
+      "UPDATE service_records SET service_date = ?, km = ?, items_json = ?, oil_spec = ?, note = ?, updated_at = ? WHERE id = ? AND user_id = ?"
+    ).run(f.service_date, f.km, JSON.stringify(f.items), f.oil_spec, f.note, nowMs(), row.id, vehicle.user_id);
+    raiseOdometer(vehicle.id, vehicle.user_id, f.km);
+  })();
+
+  const updated = db.prepare("SELECT * FROM service_records WHERE id = ?").get(row.id);
+  return res.json({ ok: true, record: recordOut(updated), vehicle: db.prepare("SELECT * FROM vehicles WHERE id = ?").get(vehicle.id) });
+});
+
+// DELETE /api/user/vehicles/:id/service-records/:recordId — removes only this
+// record. The plan stays; the next due date is derived from whatever record
+// is now the newest (or none). The odometer reading is left as it is.
+app.delete("/api/user/vehicles/:id/service-records/:recordId", requireUserAuth, (req, res) => {
+  const vehicle = ownedVehicle(req, res);
+  if (!vehicle) return;
+  const row = ownedRecord(req, res, vehicle);
+  if (!row) return;
+  db.prepare("DELETE FROM service_records WHERE id = ? AND user_id = ?").run(row.id, vehicle.user_id);
   return res.json({ ok: true });
 });
 
